@@ -12,6 +12,7 @@ services:
 
     environment:
       - PORT=8080
+      - STATIC_DIR=/app/web-dist
       # 新建微信实例时使用的镜像（多架构，amd64/arm64 自动匹配）；前缀同样跟随 WOC_IMAGE_PREFIX。
       - WOC_WECHAT_IMAGE=${WOC_IMAGE_PREFIX:-docker.io/gloridust}/wechat-on-cloud:${WOC_VERSION:-latest}
       # 透传给每个微信实例容器（KasmVNC 基础镜像用它们降权运行）
@@ -42,6 +43,8 @@ services:
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）
       - ./data-panel:/data
+      # 前端静态文件（开发模式直接覆盖，无需 docker cp）
+      - ./panel/web/dist:/app/web-dist
       # 面板经 docker 引擎创建/启动/删除微信实例容器、exec 触发下载、读取进度。
       # 注意：docker.sock 等同宿主 root 权限，故实例增删仅限管理员，docker API 绝不暴露给前端。
       - /var/run/docker.sock:/var/run/docker.sock

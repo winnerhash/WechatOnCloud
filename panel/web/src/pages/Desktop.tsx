@@ -192,6 +192,13 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     } catch {
       /* ignore */
     }
+    // 借用户手势：1) 恢复被浏览器自动播放策略挂起的 AudioContext；2) 请求通知权限
+    if (v) {
+      audioRef.current?.resumePlayback();
+      if (window.isSecureContext && 'Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+    }
   };
   // 麦克风开关（默认关）：仅在「声音」开启时有意义；默认不抢占麦克风，避免把 AirPods 切到低质通话模式。
   const [micOn, setMicOn] = useState(() => {
@@ -419,12 +426,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       api.clientLog(id, `触发通知（rms=${rms.toFixed(4)}）`);
 
       const icon = document.querySelector('link[rel~="icon"]')?.getAttribute('href') || '';
-      if (Notification.permission !== 'granted') {
-        Notification.requestPermission().then(p => {
-          if (p === 'granted') new Notification('云微：检测到提示音', { body: '可能有新消息', icon });
-        });
-      } else {
-        new Notification('云微：检测到提示音', { body: '可能有新消息', icon });
+      // 非安全上下文 / 权限被拒：静默跳过（用户首次开声音时已在手势中预请求过）
+      if ('Notification' in window && Notification.permission === 'granted') {
+        new Notification('云微', { body: '新消息', icon });
       }
     };
 
