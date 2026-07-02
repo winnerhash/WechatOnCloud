@@ -116,6 +116,7 @@ export class VncAudio {
   private socket: any = null;
   private player: PcmPlayer | null = null;
   private active = false; // 当前实例是否处于"焦点中"（应出声）
+  private playbackEnabled = true; // 是否允许本地播放；禁用时仍保持音频桥，用于后台通知监听
   private opened = false; // 是否已对服务端 emit('open')
   private micStream: MediaStream | null = null;
   private micCtx: AudioContext | null = null;
@@ -127,10 +128,27 @@ export class VncAudio {
 
   // 新增：前端可注册的音量峰值回调（rms: 0..1）
   public onAudioPeak?: (rms: number) => void;
+  public onSocketConnect?: () => void;
+  public onSocketDisconnect?: () => void;
 
   constructor(id: string, micEnabled = false) {
     this.id = id;
     this.micEnabled = micEnabled;
+  }
+
+  setPlaybackEnabled(on: boolean) {
+    if (this.destroyed) return;
+    this.playbackEnabled = on;
+    if (!on) {
+      this.player?.destroy();
+      this.player = null;
+      return;
+    }
+    if (this.active && this.socket && this.socket.connected && !this.player) {
+      this.player = new PcmPlayer();
+      this.player.init();
+      this.ensureResumeOnGesture();
+    }
   }
 
   // 麦克风开关：关 → 释放麦克风（AirPods 回到高质输出）；开且本实例在焦点 → 采集并上传。扬声器不受影响。
@@ -172,11 +190,19 @@ export class VncAudio {
       }
     });
     this.socket.on('connect', () => {
-      if (this.active) this.open();
+      if (this.onSocketConnect) {
+        try { this.onSocketConnect(); } catch {}
+      }
+      this.open();
+    });
+    this.socket.on('disconnect', () => {
+      if (this.onSocketDisconnect) {
+        try { this.onSocketDisconnect(); } catch {}
+      }
     });
   }
 
-  // 焦点变化时调用：true=本实例获得焦点（出声+收音），false=失焦（断开设备）。
+  // 焦点变化时调用：true=本实例获得焦点（出声+收音），false=失焦（停播，但保留音频桥以便后台通知检测）。
   setActive(on: boolean) {
     if (this.destroyed) return;
     this.active = on;
@@ -184,7 +210,8 @@ export class VncAudio {
       this.open();
       this.startMic();
     } else {
-      this.close();
+      this.player?.destroy();
+      this.player = null;
       this.stopMic();
     }
   }
@@ -203,7 +230,7 @@ export class VncAudio {
       this.socket.emit('open', '');
       this.opened = true;
     }
-    if (!this.player) {
+    if (this.playbackEnabled && this.active && !this.player) {
       this.player = new PcmPlayer();
       this.player.init();
     }

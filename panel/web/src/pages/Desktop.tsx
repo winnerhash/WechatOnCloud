@@ -176,10 +176,14 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     // 「重新连接」按钮与「重启实例」后的重连同样走整页重载（见 restartInstance / 桌面无响应面板）。
     window.location.reload();
   };
-  // 声音（扬声器）开关：每次打开实例都默认【关】，不持久化 on 状态（用户要求）。音频桥是额外一条到 kclient
-  // 的 socket.io，蓝牙外放(AirPods)等场景交互较敏感，默认关最稳、最可预期；想听声音手动开即可（开→建立音频桥，
-  // 关→断开）。开了之后在桌面上点一下即可解挂起出声（见下方 resumePlayback 的 iframe 手势监听）。
-  const [soundOn, setSoundOn] = useState(false);
+  // 声音（扬声器）开关：记住上次状态；关时只停本地播放，不断音频监听桥，保证后台也能做新消息提醒。
+  const [soundOn, setSoundOn] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_sound_on') === '1';
+    } catch {
+      return false;
+    }
+  });
   const toggleSound = () => {
     const v = !soundOn;
     setSoundOn(v);
@@ -218,6 +222,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const lastBeat = useRef(0);
   const audioRef = useRef<VncAudio | null>(null);
   const notifyCooldownRef = useRef<number>(0);
+  const audioSeenRef = useRef(false);
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
 
   const inst = instances.find((i) => i.id === id);
@@ -388,21 +393,30 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     return cleanup;
   }, [inputMode, showVnc, frameLoaded, id]);
 
-  // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
-  // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
+  // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流；
+  // 声音开关只控制「本地是否播放」，不影响「监听并触发通知」。
   useEffect(() => {
-    if (!showVnc || !id || !soundOn) return; // 声音默认关：未开则完全不连音频桥（回到 1.1.7 无音频的连接行为）
+    if (!showVnc || !id) return;
     const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
+    audio.setPlaybackEnabled(soundOn);
+    api.clientLog(id, '音频桥开始连接');
+    audio.onSocketConnect = () => api.clientLog(id, '音频 socket 已连接');
+    audio.onSocketDisconnect = () => api.clientLog(id, '音频 socket 已断开');
 
     // 音量峰值通知回调（阈值与冷却可微调）
     audio.onAudioPeak = (rms: number) => {
-      const THRESH = 0.08;     // 门限（RMS），根据误报/漏报调节
+      const THRESH = 0.02;     // 门限（RMS），先放低，优先确认链路可用再微调误报
       const COOLDOWN = 5000;   // ms
+      if (!audioSeenRef.current) {
+        audioSeenRef.current = true;
+        api.clientLog(id, `音频流已收到（首包 rms=${rms.toFixed(4)}）`);
+      }
       if (rms < THRESH) return;
       const now = Date.now();
       if ((notifyCooldownRef.current || 0) + COOLDOWN > now) return;
       notifyCooldownRef.current = now;
+      api.clientLog(id, `触发通知（rms=${rms.toFixed(4)}）`);
 
       const icon = document.querySelector('link[rel~="icon"]')?.getAttribute('href') || '';
       if (Notification.permission !== 'granted') {
@@ -435,9 +449,10 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       window.removeEventListener('pagehide', onPageHide);
       audio.destroy();
       audioRef.current = null;
+      audioSeenRef.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showVnc, id, soundOn]);
+  }, [showVnc, id, micOn, soundOn]);
 
   // 让「点桌面画面」也能解挂起音频出声：浏览器自动播放策略会挂起 AudioContext，需用户手势恢复；但音频桥
   // 的手势监听绑在父窗口上，而用户点的是同源 iframe 内的桌面，事件不冒泡到父窗口 → 故"点画面没用、得重开声音
