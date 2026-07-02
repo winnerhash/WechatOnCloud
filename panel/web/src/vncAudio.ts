@@ -125,6 +125,9 @@ export class VncAudio {
   private destroyed = false;
   private micEnabled = false; // 麦克风默认关：避免一打开实例就 getUserMedia 抢占麦克风（会把 AirPods 切到低质通话模式）
 
+  // 新增：前端可注册的音量峰值回调（rms: 0..1）
+  public onAudioPeak?: (rms: number) => void;
+
   constructor(id: string, micEnabled = false) {
     this.id = id;
     this.micEnabled = micEnabled;
@@ -151,6 +154,22 @@ export class VncAudio {
     });
     this.socket.on('audio', (data: ArrayBuffer) => {
       if (this.active && this.player) this.player.feed(data);
+
+      // 快速 RMS 估计并回调（非阻塞）
+      try {
+        const i16 = new Int16Array(data);
+        let sum = 0;
+        for (let i = 0; i < i16.length; i++) {
+          const v = i16[i] / 32767;
+          sum += v * v;
+        }
+        const rms = Math.sqrt(sum / (i16.length || 1));
+        if (this.onAudioPeak) {
+          try { this.onAudioPeak(rms); } catch { /* ignore callback errors */ }
+        }
+      } catch (e) {
+        /* ignore parse errors */
+      }
     });
     this.socket.on('connect', () => {
       if (this.active) this.open();

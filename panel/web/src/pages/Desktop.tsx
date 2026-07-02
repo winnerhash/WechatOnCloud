@@ -217,6 +217,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const dragDepth = useRef(0);
   const lastBeat = useRef(0);
   const audioRef = useRef<VncAudio | null>(null);
+  const notifyCooldownRef = useRef<number>(0);
   const recovering = useRef(false); // 致命崩溃自愈进行中（防错误浮层轮询与 error 事件重复触发重载）
 
   const inst = instances.find((i) => i.id === id);
@@ -393,6 +394,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     if (!showVnc || !id || !soundOn) return; // 声音默认关：未开则完全不连音频桥（回到 1.1.7 无音频的连接行为）
     const audio = new VncAudio(id, micOn);
     audioRef.current = audio;
+
+    // 音量峰值通知回调（阈值与冷却可微调）
+    audio.onAudioPeak = (rms: number) => {
+      const THRESH = 0.08;     // 门限（RMS），根据误报/漏报调节
+      const COOLDOWN = 5000;   // ms
+      if (rms < THRESH) return;
+      const now = Date.now();
+      if ((notifyCooldownRef.current || 0) + COOLDOWN > now) return;
+      notifyCooldownRef.current = now;
+
+      const icon = document.querySelector('link[rel~="icon"]')?.getAttribute('href') || '';
+      if (Notification.permission !== 'granted') {
+        Notification.requestPermission().then(p => {
+          if (p === 'granted') new Notification('云微：检测到提示音', { body: '可能有新消息', icon });
+        });
+      } else {
+        new Notification('云微：检测到提示音', { body: '可能有新消息', icon });
+      }
+    };
+
     audio.connect();
     const isFocused = () => !document.hidden && document.hasFocus();
     const sync = () => audio.setActive(isFocused());
