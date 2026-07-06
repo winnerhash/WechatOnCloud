@@ -76,10 +76,12 @@ export interface VolEntry {
 }
 
 export interface VersionInfo {
-  current: string; // 当前构建版本（如 v1.2.0 / dev-<sha>）
+  current: string; // 当前构建版本（如 v1.2.0 / v1.2.0-fork+de55e5f）
   latest: string | null; // 仓库上最新发布版（如 v1.2.1）；查不到为 null
   hasUpdate: boolean; // 有可升级目标（正式版：latest>current；开发版：查到任一正式版）
   isDev: boolean; // 当前是开发版（非正式 vX.Y.Z）
+  isFork: boolean; // 当前为 fork 构建（版本号含 -fork+ 后缀）
+  forkSha: string | null; // fork commit 短 SHA（isFork 时有值）
   checkedAt: number; // 上次检查时间戳（ms）；0=尚未检查
   source: string | null; // 数据来源：dockerhub / ghcr / dockerhub+ghcr
   error: string | null; // 检查失败原因
@@ -131,6 +133,9 @@ export const api = {
   checkUpdate: () => req<VersionInfo>('/api/admin/version/check', { method: 'POST' }),
   // 一键更新面板自身：拉新镜像 + 派生 helper 容器重建 woc-panel（带回滚）。返回后面板会重启。
   selfUpdatePanel: () => req<{ ok: boolean; target: string; message: string }>('/api/admin/version/self-update', { method: 'POST' }),
+  // Fork 更新：合并上游代码 + 重建镜像 + 重部署（fork 构建专用）
+  forkUpdatePanel: () => req<{ ok: boolean; message: string }>('/api/admin/version/fork-update', { method: 'POST' }),
+  forkUpdateStatus: () => req<{ status: string; version?: string; message?: string; code?: number }>('/api/admin/version/fork-update-status'),
 
   // 实例桌面深色（与面板主题统一的那个开关）：读取当前态 + 设置（管理员，实时切换运行中实例）。
   getDesktopTheme: () => req<{ dark: boolean }>('/api/desktop-theme'),

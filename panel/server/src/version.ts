@@ -6,10 +6,12 @@
 export const CURRENT_VERSION = (process.env.WOC_VERSION || 'dev').trim();
 
 export interface VersionInfo {
-  current: string; // 当前构建版本（如 v1.2.0 / dev-<sha>）
+  current: string; // 当前构建版本（如 v1.2.0 / v1.2.0-fork+de55e5f）
   latest: string | null; // 仓库上最新发布版（如 v1.2.1）；查不到为 null
   hasUpdate: boolean; // 有可升级目标时为 true（正式版：latest>current；开发版：查到任一正式版即可"升级到正式版"）
   isDev: boolean; // 当前不是正式语义化版本（如 dev-<sha> 本地/自构建版）
+  isFork: boolean; // 当前为 fork 构建（版本号含 -fork+ 后缀）
+  forkSha: string | null; // fork commit 短 SHA（isFork 时有值）
   checkedAt: number; // 上次检查时间戳（ms）；0 = 尚未检查
   source: string | null; // 数据来源：dockerhub / ghcr / dockerhub+ghcr
   error: string | null; // 检查失败原因（两个源都拉不到时）
@@ -25,7 +27,8 @@ function imageOwner(): string {
 const PANEL_REPO = process.env.WOC_PANEL_REPO || 'woc-panel';
 
 function parseSemver(s: string): [number, number, number] | null {
-  const m = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(s.trim());
+  // 允许 fork 后缀（如 v1.3.1-fork+de55e5f），只匹配前三段数字即可。
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(s.trim());
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
 }
 function cmpSemver(a: [number, number, number], b: [number, number, number]): number {
@@ -66,9 +69,17 @@ async function ghcrTags(owner: string): Promise<string[]> {
 }
 
 // 当前是否为"开发版"（非正式 vX.Y.Z，如本地/自构建的 dev-<sha>）。开发版允许一键"升级到正式版"。
+// fork 构建版本号如 v1.2.0-fork+de55e5f，parseSemver 会匹配前缀 v1.2.0，不算 dev。
 const IS_DEV = !parseSemver(CURRENT_VERSION);
+// fork 构建：版本号含 "-fork+" 后缀，表示基于上游某个 tag + 本地 fork commit。
+const IS_FORK = CURRENT_VERSION.includes('-fork+');
+const FORK_SHA = IS_FORK ? CURRENT_VERSION.split('-fork+')[1]?.trim() || null : null;
 
-let cache: VersionInfo = { current: CURRENT_VERSION, latest: null, hasUpdate: false, isDev: IS_DEV, checkedAt: 0, source: null, error: null };
+let cache: VersionInfo = {
+  current: CURRENT_VERSION, latest: null, hasUpdate: false,
+  isDev: IS_DEV, isFork: IS_FORK, forkSha: FORK_SHA,
+  checkedAt: 0, source: null, error: null,
+};
 let inflight: Promise<VersionInfo> | null = null;
 
 export function versionInfo(): VersionInfo {
@@ -101,6 +112,8 @@ export function checkForUpdate(): Promise<VersionInfo> {
       latest: latestBare ? `v${latestBare}` : null,
       hasUpdate,
       isDev: IS_DEV,
+      isFork: IS_FORK,
+      forkSha: FORK_SHA,
       checkedAt: Date.now(),
       source: sources.join('+') || null,
       error: tags.length ? null : '无法连接镜像仓库（Docker Hub / GHCR）',

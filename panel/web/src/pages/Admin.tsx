@@ -133,20 +133,21 @@ function DiagnosticsSection() {
 }
 
 // 「关于」：显示真实构建版本号 + 检测新版（后台已每 6h 查 Docker Hub/GHCR；这里读缓存并可手动重查）。
+// Fork 构建时显示上游基座版本，并提供「合并上游更新」一键操作。
 function AboutSection({ isAdmin }: { isAdmin: boolean }) {
   const { toast, confirm } = useUI();
   const [info, setInfo] = useState<VersionInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [outdatedInst, setOutdatedInst] = useState(0); // 镜像落后的实例数（提示"更新面板≠更新实例"）
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     api.getVersion().then(setInfo).catch(() => {});
     if (isAdmin) api.upgradeStatus().then((s) => setOutdatedInst(s.outdatedCount)).catch(() => {});
   }, [isAdmin]);
 
-  // 一键更新面板：拉新镜像 + 派生 helper 容器重建 woc-panel（数据保留，带失败回滚）。
-  // 触发后面板会被重建、本连接短暂中断，约 20s 后自动刷新到新版本。
+  // 一键更新面板（官方：拉新镜像 + helper 重建）。
   const selfUpdate = async () => {
     const ok = await confirm({
       title: info?.isDev ? '升级到正式版？' : '一键更新面板？',
@@ -158,13 +159,57 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
     try {
       const r = await api.selfUpdatePanel();
       toast(r.message || '已开始更新，面板将重启，请稍候…', 'ok');
-      window.setTimeout(() => window.location.reload(), 25000); // 等新面板起来后自动刷新
+      window.setTimeout(() => window.location.reload(), 25000);
     } catch (e: any) {
       toast(e.message || '更新失败', 'error');
       setUpdating(false);
     }
   };
-  // 是否开发版由后端 info.isDev 给出（非正式 vX.Y.Z）。开发版允许一键「升级到正式版」。
+
+  // Fork 更新：合并上游 + 重建镜像 + 重部署。通过轮询 helper 容器状态判断结果。
+  const forkUpdate = async () => {
+    const ok = await confirm({
+      title: '合并上游并重建面板？',
+      body: `将从 Gloridust/WechatOnCloud 上游获取最新代码并合并到 fork，然后重建面板镜像并重新部署。${info?.latest ? `\n上游最新版本：${info.latest}` : ''}\n预计 1-3 分钟，期间面板会重启。如有合并冲突需手动解决。`,
+      confirmText: '合并更新',
+    });
+    if (!ok) return;
+    setUpdating(true);
+    try {
+      await api.forkUpdatePanel();
+      toast('Fork 更新已启动，正在合并上游代码…', 'ok');
+      // 轮询 helper 容器状态
+      pollRef.current = setInterval(async () => {
+        try {
+          const s = await api.forkUpdateStatus();
+          if (s.status === 'success') {
+            clearInterval(pollRef.current!);
+            pollRef.current = null;
+            toast(`Fork 更新完成（${s.version ?? ''}），面板即将刷新…`, 'ok');
+            window.setTimeout(() => window.location.reload(), 8000);
+          } else if (s.status === 'conflict') {
+            clearInterval(pollRef.current!);
+            pollRef.current = null;
+            setUpdating(false);
+            toast('合并冲突：上游代码与本地修改有冲突，需到服务器手动解决', 'error');
+          } else if (s.status === 'failed') {
+            clearInterval(pollRef.current!);
+            pollRef.current = null;
+            setUpdating(false);
+            toast(`Fork 更新失败：${s.message || '未知错误'}`, 'error');
+          }
+          // 'running' | 'idle' → 继续轮询
+        } catch {
+          // 面板重启中，请求会失败 → 等重连后刷新
+        }
+      }, 10000);
+    } catch (e: any) {
+      toast(e.message || 'Fork 更新启动失败', 'error');
+      setUpdating(false);
+    }
+  };
+
+  const isFork = info?.isFork ?? false;
 
   const check = async () => {
     setChecking(true);
@@ -173,8 +218,9 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       setInfo(r);
       const rel = /^v?\d+\.\d+\.\d+$/.test(r.current);
       if (r.error) toast('检查失败：' + r.error, 'error');
-      else if (r.hasUpdate) toast(`发现新版本 ${r.latest}`, 'ok');
-      else if (!rel) toast(`最新发布 ${r.latest ?? '未知'}（当前为开发版）`, 'ok');
+      else if (r.hasUpdate) toast(isFork ? `上游有新版本 ${r.latest} 可合并` : `发现新版本 ${r.latest}`, 'ok');
+      else if (!rel && !r.isFork) toast(`最新发布 ${r.latest ?? '未知'}（当前为开发版）`, 'ok');
+      else if (r.isFork) toast(`上游最新 ${r.latest ?? '未知'}，当前 fork 已同步`, 'ok');
       else toast('已是最新版本', 'ok');
     } catch (e: any) {
       toast(e.message || '检查失败', 'error');
@@ -191,24 +237,36 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       <div className="settings-block">
         <div className="s-title-row">
           <span className="s-app">云微 · WechatOnCloud</span>
-          {info?.isDev ? <span className="tag">开发版</span> : info?.hasUpdate ? <span className="tag tag-warn">有新版</span> : null}
+          {isFork ? <span className="tag tag-on">Fork</span>
+            : info?.isDev ? <span className="tag">开发版</span>
+              : info?.hasUpdate ? <span className="tag tag-warn">有新版</span>
+                : null}
         </div>
         <p className="s-line">
           当前版本 <b>{info?.current ?? '…'}</b>
-          {info?.latest && !info.error && (info.isDev || info.hasUpdate) && (
+          {info?.latest && !info.error && (info.isDev || info.hasUpdate || isFork) && (
             <>
-              {' · '}最新{info.isDev ? '发布' : ''} <b>{info.latest}</b>
+              {' · '}最新{isFork ? '上游' : info.isDev ? '发布' : ''} <b>{info.latest}</b>
             </>
           )}
-          {info && !info.isDev && !info.hasUpdate && info.latest && !info.error && <>{' · '}已是最新</>}
+          {!isFork && info && !info.isDev && !info.hasUpdate && info.latest && !info.error && <>{' · '}已是最新</>}
         </p>
+        {isFork && info?.forkSha && (
+          <p className="s-line" style={{ opacity: 0.6, fontSize: '0.85em' }}>
+            基于 upstream/main · fork commit <code>{info.forkSha}</code>
+          </p>
+        )}
         {info?.hasUpdate && (
           <div className="ver-hint">
             {!isAdmin
-              ? '面板有新版本，请联系管理员更新。'
-              : info.isDev
-                ? '当前为开发版（本地 / 自构建）。点「升级到正式版」即可拉取最新正式发布镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。'
-                : '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'}
+              ? isFork
+                ? '上游有新版本可合并，请联系管理员操作。'
+                : '面板有新版本，请联系管理员更新。'
+              : isFork
+                ? '上游有新版本可合并。点击「合并上游更新」将自动获取上游代码、合并到 fork、重建面板镜像并重新部署（数据/登录保留，约 1-3 分钟）。如有合并冲突，需到服务器手动解决。'
+                : info.isDev
+                  ? '当前为开发版（本地 / 自构建）。点「升级到正式版」即可拉取最新正式发布镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。'
+                  : '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'}
           </div>
         )}
         {isAdmin && outdatedInst > 0 && (
@@ -218,11 +276,14 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
         )}
         <div className="settings-actions">
           {info?.hasUpdate && isAdmin && (
-            <button className="btn btn-primary s-btn" disabled={updating} onClick={selfUpdate}>
-              {updating ? '更新中…请稍候' : info.isDev ? '升级到正式版' : '一键更新面板'}
+            <button className="btn btn-primary s-btn" disabled={updating} onClick={isFork ? forkUpdate : selfUpdate}>
+              {updating ? '更新中…请稍候'
+                : isFork ? '合并上游更新'
+                  : info?.isDev ? '升级到正式版'
+                    : '一键更新面板'}
             </button>
           )}
-          {info?.hasUpdate && (
+          {info?.hasUpdate && !isFork && (
             <a className="btn-text" href={RELEASES_URL + '/latest'} target="_blank" rel="noreferrer">
               查看新版 ›
             </a>

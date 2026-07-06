@@ -11,9 +11,19 @@ set -euo pipefail
 OWNER="${WOC_IMAGE_OWNER:-gloridust}"
 TAG="${WOC_VERSION:-latest}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-# 烤进面板镜像的版本号：设了 WOC_VERSION 就用它（如 v1.2.0），否则用 dev-<短SHA>（本地构建标识）。
-# 开发版不是正式发布版，面板「关于」会标「开发版」、不会触发「有新版」红点。
-VER="${WOC_VERSION:-dev-$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo local)}"
+# 烤进面板镜像的版本号：
+#   设了 WOC_VERSION 环境变量 → 直接用它（如 v1.2.0）。
+#   未设 → 自动检测 upstream 最新 tag，生成 fork 版本号（如 v1.2.0-fork+de55e5f），
+#         面板「关于」显示"基于上游 v1.2.0"，并可检测上游新版本后一键合并更新。
+UPSTREAM_VER=$(git -C "$ROOT" describe --tags --abbrev=0 upstream/main 2>/dev/null || echo "")
+FORK_SHA=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo local)
+if [ -n "${WOC_VERSION:-}" ]; then
+  VER="$WOC_VERSION"
+elif [ -n "$UPSTREAM_VER" ]; then
+  VER="${UPSTREAM_VER}-fork+${FORK_SHA}"
+else
+  VER="dev-${FORK_SHA}"
+fi
 
 PANEL_IMAGE="ghcr.io/${OWNER}/woc-panel:${TAG}"
 WECHAT_IMAGE="ghcr.io/${OWNER}/wechat-on-cloud:${TAG}"

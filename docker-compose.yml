@@ -4,7 +4,8 @@
 services:
   panel:
     # 镜像源前缀默认 Docker Hub（飞牛等 NAS 有加速）；拉不动时改 .env 的 WOC_IMAGE_PREFIX 切到 GHCR/国内反代（见 .env.example）。
-    image: ${WOC_IMAGE_PREFIX:-docker.io/gloridust}/woc-panel:${WOC_VERSION:-latest}
+    # 面板镜像：默认拉官方，设 WOC_PANEL_IMAGE 可覆盖为自建镜像
+    image: ${WOC_PANEL_IMAGE:-${WOC_IMAGE_PREFIX:-docker.io/gloridust}/woc-panel}:${WOC_VERSION:-latest}
     container_name: woc-panel
     # pull_policy 用默认（missing）：本地已有同名镜像就直接用，没有才去镜像源拉。
     # 这样「发布前本地自构建」与「线上拉取」都能用同一份 compose。
@@ -43,6 +44,8 @@ services:
       # DNS-rebinding 防护：套 HTTPS 反代部署时把对外域名加进 .env（详见 .env.example）。
       # 默认仅放行 loopback + RFC1918 私网，直连 NAS / 局域网无需改动。
       - PANEL_ALLOWED_HOSTS=${PANEL_ALLOWED_HOSTS:-}
+      # Fork 配置：仓库宿主路径（fork 更新 helper 需要此值来挂载 repo 目录）
+      - WOC_REPO_PATH=${WOC_REPO_PATH:-/home/rogerwi/woc}
 
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）

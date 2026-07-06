@@ -92,6 +92,7 @@ import { createSession, getSession, destroySession, destroyUserSessions, SESSION
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
+import { triggerForkUpdate, forkUpdateStatus } from './fork-update.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -219,6 +220,25 @@ app.post('/api/admin/version/self-update', async (req, reply) => {
     appendPanelLog('ERROR', `面板自更新失败：${e?.message || e}`);
     return reply.code(500).send({ error: '更新失败：' + (e?.message || e) });
   }
+});
+
+// Fork 更新（管理员）：合并上游最新代码 → 重建面板镜像 → 重新部署面板。
+// 仅在 fork 构建下有意义（isFork=true）。helper 容器在宿主执行 git merge + docker build，
+// 完成后面板自动重启。冲突/构建失败时面板不变。
+app.post('/api/admin/version/fork-update', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  try {
+    const r = await triggerForkUpdate();
+    return { ok: true, ...r };
+  } catch (e: any) {
+    appendPanelLog('ERROR', `Fork 更新失败：${e?.message || e}`);
+    return reply.code(500).send({ error: 'Fork 更新失败：' + (e?.message || e) });
+  }
+});
+// 查询 fork 更新进度（管理员，前端轮询）。
+app.get('/api/admin/version/fork-update-status', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  return await forkUpdateStatus();
 });
 
 // ---------- 实例桌面深色（与面板主题统一的那个开关）----------
