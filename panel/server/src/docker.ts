@@ -1,5 +1,5 @@
 import { hostname } from 'node:os';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { appendInstanceLog, deleteInstanceLog, appendPanelLog, readInstanceLog, readPanelLog, filterSince } from './logs.js';
 import http from 'node:http';
 import zlib from 'node:zlib';
@@ -15,7 +15,8 @@ const SHM_SIZE = 1024 * 1024 * 1024; // 1gb
 // 默认关闭 KasmVNC 的 GPU 硬件编码（baseimage 检测到 /dev/dri/renderD* 时会给 Xvnc 加 -hw3d）：
 // 在 WSL2 / 虚拟 GPU 环境下该路径会导致 Xvnc 内存持续膨胀（实测反馈 21h 涨到 ~9GB）。
 // 我们已设 LIBGL_ALWAYS_SOFTWARE=1 走软件渲染，hw3d 对微信这类静态界面收益甚微。
-// 真实可用 GPU 想启用硬件编码：面板侧设 WOC_ENABLE_GPU=1。
+// 真实可用 GPU 想启用硬件编码：面板侧设 WOC_ENABLE_GPU=1，并让面板可见宿主 /dev/dri
+// （如同摄像头，把宿主 /dev 挂到 /host-dev，或设 WOC_DRI_DEVICES 显式指定）。
 const ENABLE_GPU = process.env.WOC_ENABLE_GPU === '1';
 
 // 可选：给每个实例容器设内存上限（GiB），作为 Xvnc 等异常增长时的兜底，避免拖垮宿主。
@@ -114,6 +115,47 @@ function videoDevices(): string[] {
   return [];
 }
 
+// GPU 直通：把宿主 /dev/dri 渲染节点映射进实例容器，仅 WOC_ENABLE_GPU=1 时生效。
+// 来源优先级：
+//   1) WOC_DRI_DEVICES 显式指定（逗号分隔，如 /dev/dri/renderD128,/dev/dri/card0）；
+//   2) 自动探测：扫描面板可见的 /host-dev/dri 或 /dev/dri 中的 renderD*/card*。
+// 一个都找不到则返回空：硬件编码不可用，但实例照常创建（优雅降级）。
+function driDevices(): string[] {
+  const explicit = (process.env.WOC_DRI_DEVICES || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (explicit.length) return explicit;
+  for (const dir of ['/host-dev/dri', '/dev/dri']) {
+    try {
+      if (!existsSync(dir)) continue;
+      const dris = readdirSync(dir)
+        .filter((n) => /^(renderD\d+|card\d+)$/.test(n))
+        .map((n) => `/dev/dri/${n}`); // 宿主侧设备路径
+      if (dris.length) return dris;
+    } catch {
+      /* 无权限/不可读，忽略 */
+    }
+  }
+  return [];
+}
+
+// 读取这些 DRI 设备文件的属主数字 GID。宿主上 /dev/dri/renderD* 常归属一个「动态分配」的
+// render 组（其 GID 因发行版而异），与镜像内 render 组的 GID 未必一致；仅靠组名加 GroupAdd
+// 时，容器内 abc 用户可能仍打不开渲染节点（permission denied）。把宿主侧真实数字 GID 一并
+// 加进 GroupAdd，才能保证可访问。读取失败/无权限则跳过（退回仅组名，优雅降级）。
+function driDeviceGids(devices: string[]): string[] {
+  const gids = new Set<string>();
+  for (const dev of devices) {
+    try {
+      gids.add(String(statSync(dev).gid));
+    } catch {
+      /* 设备不可 stat（面板未挂 /host-dev 等），忽略 */
+    }
+  }
+  return Array.from(gids);
+}
+
 function envList(inst: Instance): string[] {
   const env = [
     `PUID=${PUID}`,
@@ -174,6 +216,7 @@ export async function runInstance(inst: Instance): Promise<void> {
   }
   // 摄像头设备（探测不到则为空数组 → 仅摄像头不可用，音频/麦克风照常）
   const vids = videoDevices();
+  const dris = ENABLE_GPU ? driDevices() : [];
   const hostConfig: Docker.HostConfig = {
     Binds: [`${inst.volumeName}:/config`],
     NetworkMode: net || undefined,
@@ -189,6 +232,17 @@ export async function runInstance(inst: Instance): Promise<void> {
     hostConfig.Devices = vids.map((d) => ({ PathOnHost: d, PathInContainer: d, CgroupPermissions: 'rwm' }));
     hostConfig.GroupAdd = ['video']; // 让容器内 abc 用户能访问 /dev/videoN
     console.log(`[docker] 实例 ${inst.id} 挂载摄像头设备: ${vids.join(', ')}`);
+  }
+  if (dris.length) {
+    hostConfig.Devices = [
+      ...(hostConfig.Devices || []),
+      ...dris.map((d) => ({ PathOnHost: d, PathInContainer: d, CgroupPermissions: 'rwm' })),
+    ];
+    // 组名 render/video + 宿主侧真实数字 GID（应对 render 组 GID 在宿主与镜像间不一致的常见情况）。
+    hostConfig.GroupAdd = Array.from(
+      new Set([...(hostConfig.GroupAdd || []), 'render', 'video', ...driDeviceGids(dris)]),
+    );
+    console.log(`[docker] 实例 ${inst.id} 挂载 GPU 渲染设备: ${dris.join(', ')}`);
   }
   // 伪装成真实有线网卡 MAC（厂商 OUI），替代容器默认的本地管理位 MAC。
   const mac = realisticMac(inst.id);
@@ -212,6 +266,8 @@ export async function runInstance(inst: Instance): Promise<void> {
   try {
     await container.start();
     appendInstanceLog(inst.id, '容器已启动');
+    // 容器重建后恢复持久化的字体配置 / xsettingsd
+    restoreFontFromVolume(inst).catch(() => {});
   } catch (e) {
     // 启动失败但容器已被创建出来（Created 状态），不清理的话会成为"幽灵容器"——
     // 它仍占着卷名 woc-data-<id>，让后续删卷报 409。修复 #23 时发现 4 个此类残留。
@@ -414,6 +470,29 @@ export async function instanceRuntime(inst: Instance): Promise<RuntimeState> {
   }
 }
 
+// 本地「最新实例镜像」的 Id（新建/升级实例会用到的镜像）。查不到（未拉取过）返回 null。
+export async function latestInstanceImageId(): Promise<string | null> {
+  try {
+    const img: any = await docker.getImage(WECHAT_IMAGE).inspect();
+    return String(img.Id);
+  } catch {
+    return null;
+  }
+}
+
+// 实例是否「镜像落后」：其运行中容器的镜像 Id 与本地最新镜像不一致（即重建就会换新镜像）。
+// 容器不存在 / 查不到最新镜像时返回 false（不打扰）。传入 latestId 复用一次查询，避免 N 次 inspect。
+export async function instanceOutdated(inst: Instance, latestId: string | null): Promise<boolean> {
+  if (!latestId) return false;
+  try {
+    const info: any = await docker.getContainer(inst.containerName).inspect();
+    const cur = String(info.Image || '');
+    return !!cur && cur !== latestId;
+  } catch {
+    return false; // 容器不存在（未创建/已删）→ 不算落后
+  }
+}
+
 // 创建 exec 实例。容器 init 未完成时，linuxserver 基镜像的 'abc' 用户可能还没建好，docker 会以
 // 400「unable to find user abc: no matching entries in passwd file」直接拒绝创建 exec（见 issue #74）。
 // 对这种"用户未就绪"错误短暂重试，给容器 init 一点时间；超时则抛清晰的中文错误，而非透传难懂的 docker 400。
@@ -433,9 +512,9 @@ async function execCreate(c: any, opts: any): Promise<any> {
 }
 
 // 在实例容器内执行命令，返回 stdout；若命令失败，把 stderr 透出给调用方。
-async function execCapture(inst: Instance, cmd: string[]): Promise<string> {
+async function execCapture(inst: Instance, cmd: string[], user = 'abc'): Promise<string> {
   const c = docker.getContainer(inst.containerName);
-  const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: 'abc' });
+  const exec = await execCreate(c, { Cmd: cmd, AttachStdout: true, AttachStderr: true, Tty: false, User: user });
   const stream = await exec.start({ hijack: true, stdin: false });
   return await new Promise<string>((resolve, reject) => {
     let out = '';
@@ -504,13 +583,40 @@ export async function wechatStatus(inst: Instance): Promise<WechatStatus> {
 
 // 拉取微信镜像（首次部署/更新镜像用）。返回拉取日志的最后状态。
 export async function pullImage(onProgress?: (line: any) => void): Promise<void> {
+  // 无进度超时：NAS 直连 docker.io 常卡死（拉取流僵住、永不结束），旧版会让"创建实例"请求无限 hang，
+  // 前端一直转圈、还删不掉（issue #99）。这里只要 N 分钟内没有任何进度就中止拉取，让创建带清晰错误快速失败、
+  // 用户可重试/删除。默认 5 分钟，WOC_PULL_STALL_MIN 可调。
+  const STALL_MS = 1000 * 60 * Math.max(2, Number(process.env.WOC_PULL_STALL_MIN) || 5);
   return await new Promise((resolve, reject) => {
     docker.pull(WECHAT_IMAGE, (err: any, stream: NodeJS.ReadableStream) => {
       if (err) return reject(err);
+      let done = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (e: any) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        e ? reject(e) : resolve();
+      };
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          try {
+            (stream as any).destroy?.();
+          } catch {
+            /* ignore */
+          }
+          finish(new Error(`拉取镜像 ${Math.round(STALL_MS / 60000)} 分钟无进度，判定网络卡死并中止（建议配置国内镜像源或预拉取，详见 README）`));
+        }, STALL_MS);
+      };
+      arm();
       docker.modem.followProgress(
         stream,
-        (e: any) => (e ? reject(e) : resolve()),
-        (ev: any) => onProgress?.(ev),
+        (e: any) => finish(e),
+        (ev: any) => {
+          arm(); // 每有进度就重置超时
+          onProgress?.(ev);
+        },
       );
     });
   });
@@ -686,6 +792,13 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
 // 校验文件名为安全 basename（防路径穿越）。
 function safeName(name: string): boolean {
   return !!name && name.length <= 200 && !name.includes('/') && !name.includes('\0') && name !== '.' && name !== '..';
+}
+
+// 壁纸/字体文件名：在 safeName 基础上，额外拒绝 shell 元字符。这些名字会被拼进 `sh -c '...${name}...'`
+// （xwallpaper/fc-scan 等），拒绝 ' " $ ` \ ; & | < > 及换行后，单引号内插值不可能被逃逸/注入，正常文件名
+//（含空格/括号/中文）仍放行。
+function safeMediaName(name: string): boolean {
+  return safeName(name) && !/['"$`\\;&|<>\r\n]/.test(name);
 }
 
 export async function uploadToInstance(inst: Instance, name: string, content: Buffer): Promise<void> {
@@ -937,6 +1050,204 @@ export async function volBackupStream(inst: Instance): Promise<NodeJS.ReadableSt
 // 整卷恢复：仅适用于本系统导出的备份（条目前缀 config/），解到容器根 → 落回 /config。要求实例已停止。
 export async function volRestoreArchive(inst: Instance, archive: Buffer): Promise<void> {
   await docker.getContainer(inst.containerName).putArchive(maybeGunzip(archive), { path: '/' });
+}
+
+// ---------- 桌面壁纸 ----------
+const BG_DIR = '/config/backgrounds';
+const WP_FILE = '/config/.wallpaper';
+
+export async function listBackgrounds(inst: Instance): Promise<string[]> {
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `ls -1 ${BG_DIR} 2>/dev/null || true`]);
+    return out.split('\n').filter(Boolean);
+  } catch { return []; }
+}
+
+// 注：不再用 ImageMagick(convert) 生成缩略图（凭空胖 ~100MB + 引入注入点），直接回原图，前端按需缩放。
+// thumb 参数保留以兼容调用方，忽略之。
+export async function getBackgroundImage(inst: Instance, name: string, _thumb = false): Promise<Buffer> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  const path = `${BG_DIR}/${name}`;
+  const stream = (await docker.getContainer(inst.containerName).getArchive({ path })) as NodeJS.ReadableStream;
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve, reject) => {
+    stream.on('data', (d: Buffer) => chunks.push(d));
+    stream.on('end', () => resolve());
+    stream.on('error', reject);
+  });
+  return extractSingleFileFromTar(Buffer.concat(chunks));
+}
+
+export async function uploadBackground(inst: Instance, name: string, content: Buffer): Promise<void> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await execCapture(inst, ['mkdir', '-p', BG_DIR]);
+  await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: BG_DIR });
+}
+
+// 检查实例容器内是否有某命令；没有则抛出友好错误（多为旧镜像未升级，避免用户看懵"退出码 127"）。
+async function assertHasTool(inst: Instance, tool: string, msg: string): Promise<void> {
+  let ok = false;
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `command -v ${tool} >/dev/null 2>&1 && printf ok`]);
+    ok = out.trim() === 'ok';
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new Error(msg);
+}
+
+export async function applyBackground(inst: Instance, name: string): Promise<void> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await assertHasTool(inst, 'xwallpaper', '该实例镜像过旧（缺壁纸组件 xwallpaper）。请先在「管理」对该实例点「升级」，再设置壁纸。');
+  await execCapture(inst, ['sh', '-c', `DISPLAY=:1 xwallpaper --zoom '${BG_DIR}/${name}' 2>/dev/null`]);
+  await execCapture(inst, ['sh', '-c', `echo '${name}' > '${WP_FILE}'`]);
+}
+
+export async function deleteBackground(inst: Instance, name: string): Promise<void> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await execCapture(inst, ['rm', '-f', `${BG_DIR}/${name}`]);
+  await execCapture(inst, ['sh', '-c', `if [ -f '${WP_FILE}' ] && [ "$(cat '${WP_FILE}')" = '${name}' ]; then rm -f '${WP_FILE}'; fi`]);
+}
+
+export async function getCurrentBackground(inst: Instance): Promise<string> {
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `cat ${WP_FILE} 2>/dev/null || true`]);
+    return out.trim();
+  } catch { return ''; }
+}
+
+export async function clearBackground(inst: Instance): Promise<void> {
+  await execCapture(inst, ['sh', '-c', 'DISPLAY=:1 xsetroot -solid black 2>/dev/null']);
+  await execCapture(inst, ['rm', '-f', WP_FILE]);
+}
+
+// ---------- 字体管理 ----------
+const FONT_DIR = '/config/.fonts';
+
+export async function listFonts(inst: Instance): Promise<string[]> {
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `ls -1 ${FONT_DIR} 2>/dev/null || true`]);
+    return out.split('\n').filter(Boolean);
+  } catch { return []; }
+}
+
+export async function uploadFont(inst: Instance, name: string, content: Buffer): Promise<void> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await execCapture(inst, ['mkdir', '-p', FONT_DIR]);
+  await docker.getContainer(inst.containerName).putArchive(tarSingleFile(name, content), { path: FONT_DIR });
+  await execCapture(inst, ['fc-cache', '-f'], 'root');
+}
+
+export async function deleteFont(inst: Instance, name: string): Promise<void> {
+  if (!safeMediaName(name)) throw new Error('文件名不合法');
+  await execCapture(inst, ['rm', '-f', `${FONT_DIR}/${name}`]);
+  await execCapture(inst, ['fc-cache', '-f'], 'root');
+}
+
+const FONT_SEL_FILE = '/config/.woc-font';
+
+// 将字体的 fontconfig family name 设为用户首选（fallback 仍用文泉驿等系统字体）。
+// 设空字符串或 "default" 则清除偏好，回退系统默认。
+export async function applyFont(inst: Instance, fontFile: string): Promise<void> {
+  if (fontFile && !safeMediaName(fontFile)) throw new Error('文件名不合法');
+  if (fontFile && fontFile !== 'default') {
+    // 用 fc-scan 读取字体实际 family name（取第一个）
+    const out = await execCapture(inst, ['sh', '-c', `fc-scan --format='%{family[0]}' '${FONT_DIR}/${fontFile}' 2>/dev/null`]);
+    const family = out.trim();
+    if (!family) throw new Error('未能识别该字体的 family name');
+    // 写 fontconfig 系统级配置（/etc/fonts/local.conf 保证被读取，用户级可能被 XDG 路径问题跳过）
+    const xml = `<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <!-- generic families -->
+  <alias>
+    <family>sans-serif</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <alias>
+    <family>serif</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <alias>
+    <family>monospace</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <!-- system CJK fonts that WeChat/CEF may request -->
+  <alias>
+    <family>WenQuanYi Micro Hei</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <alias>
+    <family>WenQuanYi Zen Hei</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <alias>
+    <family>Noto Sans CJK SC</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <alias>
+    <family>Noto Sans CJK</family>
+    <prefer><family>${family}</family></prefer>
+  </alias>
+  <!-- force user font for any zh text regardless of requested family -->
+  <match target="pattern">
+    <test name="lang" compare="contains"><string>zh</string></test>
+    <edit name="family" mode="prepend" binding="strong"><string>${family}</string></edit>
+  </match>
+</fontconfig>`;
+    await execCapture(inst, ['bash', '-c', `cat > /etc/fonts/local.conf << 'CONF'\n${xml}\nCONF`], 'root');
+    execCapture(inst, ['bash', '-c', `cat > /config/.woc-fc-local.conf << 'CONF'\n${xml}\nCONF`], 'root').catch(() => {});
+    await execCapture(inst, ['fc-cache', '-f'], 'root');
+    await execCapture(inst, ['sh', '-c', `echo '${fontFile}' > ${FONT_SEL_FILE}`]);
+    await execCapture(inst, ['bash', '-c', `cat > ${FONT_SEL_FILE}-family << 'FAMILYEOF'\n${family}\nFAMILYEOF`]);
+    // 更新 xsettingsd 配置 → GTK/Qt 应用实时响应
+    applyXsettingsFont(inst, family).catch(() => {});
+  } else {
+    // 清除偏好，回退默认（文泉驿等系统字体）
+    await execCapture(inst, ['rm', '-f', '/etc/fonts/local.conf', '/config/.woc-fc-local.conf'], 'root');
+    await execCapture(inst, ['rm', '-f', '/config/.config/fontconfig/fonts.conf']);
+    await execCapture(inst, ['fc-cache', '-f'], 'root');
+    await execCapture(inst, ['rm', '-f', FONT_SEL_FILE, `${FONT_SEL_FILE}-family`]);
+    applyXsettingsFont(inst, 'WenQuanYi Micro Hei').catch(() => {});
+  }
+}
+
+async function applyXsettingsFont(inst: Instance, family: string): Promise<void> {
+  const conf = '/config/.xsettingsd';
+  const lines = [
+    'Xft/Antialias 1',
+    'Xft/Hinting 1',
+    'Xft/HintStyle "hintslight"',
+    'Xft/RGBA "rgb"',
+    'Xft/DPI 96',
+    `Gtk/FontName "${family} 10"`,
+  ];
+  await execCapture(inst, ['sh', '-c', `printf '%s\\n' ${lines.map(l => `'${l}'`).join(' ')} > ${conf}`]);
+  await execCapture(inst, ['sh', '-c', 'pkill -HUP xsettingsd 2>/dev/null || xsettingsd --config=/config/.xsettingsd 2>/dev/null &']);
+}
+
+// 返回当前选中的字体文件名，空字符串表示默认
+export async function getAppliedFont(inst: Instance): Promise<string> {
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `cat ${FONT_SEL_FILE} 2>/dev/null || true`]);
+    return out.trim();
+  } catch { return ''; }
+}
+
+export async function getFontFamily(inst: Instance, fontFile: string): Promise<string> {
+  if (!safeMediaName(fontFile)) throw new Error('文件名不合法');
+  try {
+    const out = await execCapture(inst, ['sh', '-c', `fc-scan '${FONT_DIR}/${fontFile}' 2>/dev/null | grep 'family:' | head -1 | cut -d'"' -f2`]);
+    return out.trim();
+  } catch { return ''; }
+}
+
+// 容器重建后从挂载卷恢复字体配置 & xsettingsd（不依赖 autostart 镜像版本）
+async function restoreFontFromVolume(inst: Instance): Promise<void> {
+  await execCapture(inst, ['bash', '-c', 'if [ -f /config/.woc-fc-local.conf ]; then cp /config/.woc-fc-local.conf /etc/fonts/local.conf && fc-cache -f; fi'], 'root').catch(() => {});
+  const famOut = await execCapture(inst, ['sh', '-c', 'cat /config/.woc-font-family 2>/dev/null || true']).catch(() => '');
+  const family = famOut.trim();
+  if (family) applyXsettingsFont(inst, family).catch(() => {});
 }
 
 // 实例容器名（供反代构造 target）。

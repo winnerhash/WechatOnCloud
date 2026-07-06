@@ -43,6 +43,8 @@ import {
   runInstance,
   stopInstance,
   upgradeInstance,
+  latestInstanceImageId,
+  instanceOutdated,
   removeInstance as removeInstanceContainer,
   instanceRuntime,
   triggerWechat,
@@ -72,8 +74,21 @@ import {
   volDownloadFile,
   volBackupStream,
   volRestoreArchive,
+  listBackgrounds,
+  uploadBackground,
+  applyBackground,
+  deleteBackground,
+  getBackgroundImage,
+  getCurrentBackground,
+  clearBackground,
+  listFonts,
+  uploadFont,
+  deleteFont,
+  applyFont,
+  getAppliedFont,
+  getFontFamily,
 } from './docker.js';
-import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
+import { createSession, getSession, destroySession, destroyUserSessions, SESSION_TTL_MS } from './sessions.js';
 import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard.js';
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
@@ -118,6 +133,9 @@ app.addHook('onRequest', async (req, reply) => {
 await app.register(cookie);
 // 文件上传走原始二进制（前端以 application/octet-stream 直传 File）
 app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer' }, (_req, body, done) => done(null, body));
+// Heartbeat and other no-body POST routes send no Content-Type; fall through to this wildcard
+// instead of being rejected with 415. Fastify's exact-match parsers above take priority.
+app.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, _body, done) => done(null, null));
 
 // ---------- 鉴权辅助 ----------
 function currentUser(req: FastifyRequest): User | null {
@@ -160,7 +178,7 @@ app.post('/api/auth/login', async (req, reply) => {
     httpOnly: true,
     sameSite: 'lax',
     path: '/',
-    maxAge: 60 * 60 * 12,
+    maxAge: Math.floor(SESSION_TTL_MS / 1000), // 与服务端会话时长一致（WOC_SESSION_DAYS，默认 30 天）
   });
   return { user: publicUser(u) };
 });
@@ -635,6 +653,42 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
   }
 });
 
+// 实例镜像升级状态：哪些实例的镜像落后于本地最新镜像（用于面板"实例可升级"红点 + 一键升级）。
+// 面板与实例是两套镜像/容器：更新面板不会动实例，故用户常"更新了面板、实例还是旧镜像"（例：设壁纸报 127）。
+app.get('/api/admin/instances/upgrade-status', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const latestId = await latestInstanceImageId();
+  const list = listInstances();
+  const results = await Promise.all(
+    list.map(async (inst) => ({ id: inst.id, name: inst.name, outdated: await instanceOutdated(inst, latestId) })),
+  );
+  const outdated = results.filter((r) => r.outdated);
+  return { known: !!latestId, outdatedCount: outdated.length, outdatedIds: outdated.map((r) => r.id), instances: results };
+});
+
+// 一键升级全部"镜像落后"的实例（顺序执行，逐个 best-effort；个别失败不影响其余）。
+app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const latestId = await latestInstanceImageId();
+  if (!latestId) return reply.code(409).send({ error: '本地尚无实例镜像，无法判断是否需要升级（请先联网拉取）' });
+  const list = listInstances();
+  let upgraded = 0;
+  let failed = 0;
+  for (const inst of list) {
+    if (!(await instanceOutdated(inst, latestId))) continue;
+    try {
+      appendPanelLog('INFO', `一键升级实例「${inst.name}」(id=${inst.id})…`);
+      await upgradeInstance(inst);
+      upgraded++;
+    } catch (e: any) {
+      failed++;
+      appendPanelLog('ERROR', `一键升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
+    }
+  }
+  appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgraded}、失败 ${failed}`);
+  return { ok: true, upgraded, failed };
+});
+
 // 实例侧：设置该实例可被哪些账户访问
 app.post('/api/admin/instances/:id/users', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
@@ -1006,6 +1060,150 @@ app.post('/api/admin/instances/:id/wechat/install', async (req, reply) => {
 app.post('/api/admin/instances/:id/wechat/update', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   return triggerInstanceWechat((req.params as any).id, 'update', reply);
+});
+
+// ---------- 桌面壁纸管理 ----------
+const bgHandler = (id: string, reply: FastifyReply): Instance | null => {
+  const inst = findInstance(id);
+  if (!inst) {
+    reply.code(404).send({ error: '实例不存在' });
+    return null; // 关键：reply 是 truthy，不能 return 它，否则调用方 `if (!inst)` 拦不住
+  }
+  return inst;
+};
+
+app.get('/api/admin/instances/:id/backgrounds', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try { return { backgrounds: await listBackgrounds(inst) }; }
+  catch (e: any) { return reply.code(500).send({ error: e?.message || '列出壁纸失败' }); }
+});
+
+app.post('/api/admin/instances/:id/backgrounds', { bodyLimit: 50 * 1024 * 1024 }, async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  const name = String((req.query as any)?.name || '').trim();
+  const body = req.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件' });
+  try {
+    await uploadBackground(inst, name, body);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '上传失败' }); }
+});
+
+app.get('/api/admin/instances/:id/backgrounds/current', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try { return { background: await getCurrentBackground(inst) }; }
+  catch (e: any) { return reply.code(500).send({ error: e?.message || '获取当前壁纸失败' }); }
+});
+
+app.get('/api/admin/instances/:id/backgrounds/:name/image', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    const buf = await getBackgroundImage(inst, (req.params as any).name, true);
+    const name = (req.params as any).name as string;
+    const ext = name.includes('.') ? name.split('.').pop()!.toLowerCase() : 'png';
+    const mime: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
+    reply.header('Content-Type', mime[ext] || 'application/octet-stream');
+    reply.header('Cache-Control', 'public, max-age=86400');
+    return reply.send(buf);
+  } catch (e: any) { return reply.code(404).send({ error: '图片不存在' }); }
+});
+
+app.post('/api/admin/instances/:id/backgrounds/:name/apply', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await applyBackground(inst, (req.params as any).name);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '应用壁纸失败' }); }
+});
+
+app.post('/api/admin/instances/:id/backgrounds/clear', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await clearBackground(inst);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '清除壁纸失败' }); }
+});
+
+app.delete('/api/admin/instances/:id/backgrounds/:name', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await deleteBackground(inst, (req.params as any).name);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '删除失败' }); }
+});
+
+// ---------- 字体管理 ----------
+app.get('/api/admin/instances/:id/fonts', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try { return { fonts: await listFonts(inst) }; }
+  catch (e: any) { return reply.code(500).send({ error: e?.message || '列出字体失败' }); }
+});
+
+app.post('/api/admin/instances/:id/fonts', { bodyLimit: 50 * 1024 * 1024 }, async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  const name = String((req.query as any)?.name || '').trim();
+  const body = req.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件' });
+  try {
+    await uploadFont(inst, name, body);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '上传失败' }); }
+});
+
+app.delete('/api/admin/instances/:id/fonts/:name', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await deleteFont(inst, (req.params as any).name);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '删除失败' }); }
+});
+
+app.get('/api/admin/instances/:id/fonts/current', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try { return { fontFile: await getAppliedFont(inst) }; }
+  catch (e: any) { return reply.code(500).send({ error: e?.message || '获取当前字体失败' }); }
+});
+
+app.post('/api/admin/instances/:id/fonts/:name/apply', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await applyFont(inst, (req.params as any).name);
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '应用字体失败' }); }
+});
+
+app.post('/api/admin/instances/:id/fonts/default', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const inst = bgHandler((req.params as any).id, reply);
+  if (!inst) return;
+  try {
+    await applyFont(inst, 'default');
+    return { ok: true };
+  } catch (e: any) { return reply.code(400).send({ error: e?.message || '重置字体失败' }); }
 });
 
 // ---------- 反向代理到内网 KasmVNC（按实例注入 Basic auth，会话 + 权限把守） ----------

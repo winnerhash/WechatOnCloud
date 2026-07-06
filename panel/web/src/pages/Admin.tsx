@@ -138,18 +138,20 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
   const [info, setInfo] = useState<VersionInfo | null>(null);
   const [checking, setChecking] = useState(false);
   const [updating, setUpdating] = useState(false);
+  const [outdatedInst, setOutdatedInst] = useState(0); // 镜像落后的实例数（提示"更新面板≠更新实例"）
 
   useEffect(() => {
     api.getVersion().then(setInfo).catch(() => {});
-  }, []);
+    if (isAdmin) api.upgradeStatus().then((s) => setOutdatedInst(s.outdatedCount)).catch(() => {});
+  }, [isAdmin]);
 
   // 一键更新面板：拉新镜像 + 派生 helper 容器重建 woc-panel（数据保留，带失败回滚）。
   // 触发后面板会被重建、本连接短暂中断，约 20s 后自动刷新到新版本。
   const selfUpdate = async () => {
     const ok = await confirm({
-      title: '一键更新面板？',
-      body: `将拉取最新镜像并重建面板容器（数据/登录保留），约十几秒、期间面板会短暂重启，完成后自动刷新。${info?.latest ? `\n目标版本：${info.latest}` : ''}`,
-      confirmText: '更新',
+      title: info?.isDev ? '升级到正式版？' : '一键更新面板？',
+      body: `将拉取最新${info?.isDev ? '正式发布' : ''}镜像并重建面板容器（数据/登录保留），约十几秒、期间面板会短暂重启，完成后自动刷新。${info?.latest ? `\n目标版本：${info.latest}` : ''}`,
+      confirmText: info?.isDev ? '升级' : '更新',
     });
     if (!ok) return;
     setUpdating(true);
@@ -162,10 +164,7 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       setUpdating(false);
     }
   };
-
-  // 当前版本是否为正式发布版（语义化 vX.Y.Z）。dev / dev-<sha> 等本地构建无法与发布版比较，
-  // 既不显示「已是最新」也不显示红点，只把最新发布版作为信息展示。
-  const isRelease = !!info && /^v?\d+\.\d+\.\d+$/.test(info.current);
+  // 是否开发版由后端 info.isDev 给出（非正式 vX.Y.Z）。开发版允许一键「升级到正式版」。
 
   const check = async () => {
     setChecking(true);
@@ -192,33 +191,35 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
       <div className="settings-block">
         <div className="s-title-row">
           <span className="s-app">云微 · WechatOnCloud</span>
-          {info?.hasUpdate ? <span className="tag tag-warn">有新版</span> : info && !isRelease ? <span className="tag">开发版</span> : null}
+          {info?.isDev ? <span className="tag">开发版</span> : info?.hasUpdate ? <span className="tag tag-warn">有新版</span> : null}
         </div>
         <p className="s-line">
           当前版本 <b>{info?.current ?? '…'}</b>
-          {info?.hasUpdate && info.latest && (
+          {info?.latest && !info.error && (info.isDev || info.hasUpdate) && (
             <>
-              {' · '}最新 <b>{info.latest}</b>
+              {' · '}最新{info.isDev ? '发布' : ''} <b>{info.latest}</b>
             </>
           )}
-          {isRelease && info && !info.hasUpdate && info.latest && !info.error && <>{' · '}已是最新</>}
-          {!isRelease && info?.latest && !info.error && (
-            <>
-              {' · '}最新发布 <b>{info.latest}</b>
-            </>
-          )}
+          {info && !info.isDev && !info.hasUpdate && info.latest && !info.error && <>{' · '}已是最新</>}
         </p>
         {info?.hasUpdate && (
           <div className="ver-hint">
-            {isAdmin
-              ? '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'
-              : '面板有新版本，请联系管理员更新。'}
+            {!isAdmin
+              ? '面板有新版本，请联系管理员更新。'
+              : info.isDev
+                ? '当前为开发版（本地 / 自构建）。点「升级到正式版」即可拉取最新正式发布镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。'
+                : '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'}
+          </div>
+        )}
+        {isAdmin && outdatedInst > 0 && (
+          <div className="ver-hint">
+            ⚠️ 另有 <b>{outdatedInst}</b> 个实例的镜像可升级。<b>更新面板不会自动升级实例</b>（二者是不同镜像）——请到「管理」用「一键升级全部实例」。
           </div>
         )}
         <div className="settings-actions">
           {info?.hasUpdate && isAdmin && (
             <button className="btn btn-primary s-btn" disabled={updating} onClick={selfUpdate}>
-              {updating ? '更新中…请稍候' : '一键更新面板'}
+              {updating ? '更新中…请稍候' : info.isDev ? '升级到正式版' : '一键更新面板'}
             </button>
           )}
           {info?.hasUpdate && (
@@ -267,6 +268,8 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [volumeInst, setVolumeInst] = useState<InstanceWithStatus | null>(null); // 数据卷管理弹窗
   const [iconInst, setIconInst] = useState<InstanceWithStatus | null>(null); // 图标编辑弹窗
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
+  const [upg, setUpg] = useState<{ outdatedCount: number; outdatedIds: string[] } | null>(null); // 镜像落后的实例
+  const [upgradingAll, setUpgradingAll] = useState(false);
   // 未使用的旧数据卷（来自之前删实例时未勾选"彻底清除"）：允许复用以继承聊天记录，或显式删除。
   const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
   // 残留 woc-wx-* 容器（runInstance 启动失败遗留的 Created 容器等）：占着卷名让删卷报 409。
@@ -297,6 +300,12 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
       setOrphanVols(volumes);
     } catch {
       /* ignore */
+    }
+    try {
+      const s = await api.upgradeStatus();
+      setUpg({ outdatedCount: s.outdatedCount, outdatedIds: s.outdatedIds });
+    } catch {
+      /* ignore：更新检测失败不影响管理页 */
     }
     try {
       const { containers } = await api.listOrphanContainers();
@@ -403,6 +412,28 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     }
   };
 
+  // 一键升级全部"镜像落后"的实例（逐个拉新镜像重建，可能几分钟）。
+  const upgradeAll = async () => {
+    const n = upg?.outdatedCount || 0;
+    const ok = await confirm({
+      title: `升级全部 ${n} 个可升级实例？`,
+      body: '将逐个拉取最新实例镜像并重建（数据保留），每个约十几秒到几分钟；期间这些实例会短暂重连。',
+      confirmText: '全部升级',
+    });
+    if (!ok) return;
+    setUpgradingAll(true);
+    toast('正在逐个升级实例，请勿离开…', 'info');
+    try {
+      const r = await api.upgradeAllInstances();
+      toast(`升级完成：成功 ${r.upgraded}${r.failed ? `、失败 ${r.failed}` : ''}`, r.failed ? 'error' : 'ok');
+      await load();
+    } catch (e: any) {
+      toast(e.message || '升级失败', 'error');
+    } finally {
+      setUpgradingAll(false);
+    }
+  };
+
   const instName = (id: string) => instances.find((i) => i.id === id)?.name || id;
   const usersForInstance = (id: string) => subs.filter((u) => u.allowedInstances.includes(id));
 
@@ -447,6 +478,17 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                 + 新建实例
               </button>
             </div>
+            {!!upg?.outdatedCount && (
+              <div className="upgrade-banner">
+                <span>
+                  有 <b>{upg.outdatedCount}</b> 个实例的镜像可升级到最新版。
+                  <span className="muted small">（更新面板不会自动升级实例，二者是不同镜像）</span>
+                </span>
+                <button className="btn btn-primary s-btn" disabled={upgradingAll} onClick={upgradeAll}>
+                  {upgradingAll ? '升级中…请稍候' : '一键升级全部实例'}
+                </button>
+              </div>
+            )}
             {instances.length === 0 ? (
               <EmptyState
                 icon="🖥️"
@@ -464,6 +506,7 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                   <InstanceAdminCard
                     key={inst.id}
                     inst={inst}
+                    outdated={!!upg?.outdatedIds.includes(inst.id)}
                     userCount={usersForInstance(inst.id).length}
                     acting={acting[inst.id]}
                     onEnter={() => nav(`/i/${inst.id}`)}
@@ -1089,6 +1132,7 @@ function DeleteInstance({ inst, onClose, onDone }: { inst: InstanceWithStatus; o
 // 管理页的实例卡片：含微信版本管理（下载/更新）+ 重命名/分配/删除
 function InstanceAdminCard({
   inst,
+  outdated,
   userCount,
   acting,
   onEnter,
@@ -1105,6 +1149,7 @@ function InstanceAdminCard({
   onIcon,
 }: {
   inst: InstanceWithStatus;
+  outdated?: boolean;
   userCount: number;
   acting?: string;
   onEnter: () => void;
@@ -1159,6 +1204,11 @@ function InstanceAdminCard({
       <div className="inst-head">
         <span className="inst-name">{inst.name}</span>
         <span className={'tag ' + badge.cls}>{badge.text}</span>
+        {outdated && !acting && (
+          <span className="tag tag-warn" title="该实例的镜像落后于最新版，点「升级实例」可更新">
+            可升级
+          </span>
+        )}
       </div>
       <div className="inst-sub">
         {sub}
