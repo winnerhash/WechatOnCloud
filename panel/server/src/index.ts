@@ -112,7 +112,7 @@ function basicAuth(inst: Instance) {
 
 initStore();
 
-const app = Fastify({ logger: true, trustProxy: true });
+const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 50 * 1024 * 1024 });
 
 // DNS-rebinding gate: reject requests whose Host header is neither a loopback /
 // RFC1918 LAN address nor in PANEL_ALLOWED_HOSTS. Runs before every route so
