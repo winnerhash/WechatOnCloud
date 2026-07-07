@@ -25,6 +25,8 @@ sleep 3
 
 # ---- Step 1: Fetch upstream ----
 cd "$REPO"
+# helper 容器以 root 运行、仓库属主是宿主用户 → git 报 dubious ownership，需放行
+git config --global --add safe.directory "$REPO"
 log "Fetching upstream..."
 git fetch upstream 2>&1 || { err "git fetch upstream failed"; exit 1; }
 
