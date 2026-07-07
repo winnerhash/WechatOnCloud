@@ -141,10 +141,18 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
   const [updating, setUpdating] = useState(false);
   const [outdatedInst, setOutdatedInst] = useState(0); // 镜像落后的实例数（提示"更新面板≠更新实例"）
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [remoteNewer, setRemoteNewer] = useState(false); // 远端有新实例镜像（本地还没拉）
 
   useEffect(() => {
     api.getVersion().then(setInfo).catch(() => {});
-    if (isAdmin) api.upgradeStatus().then((s) => setOutdatedInst(s.outdatedCount)).catch(() => {});
+    if (isAdmin)
+      api
+        .upgradeStatus()
+        .then((s) => {
+          setOutdatedInst(s.outdatedCount);
+          setRemoteNewer(s.remoteNewer === true);
+        })
+        .catch(() => {});
   }, [isAdmin]);
 
   // 一键更新面板（官方：拉新镜像 + helper 重建）。
@@ -269,9 +277,10 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
                   : '点「一键更新面板」即可自动拉新镜像并重建面板（数据/登录保留，约十几秒、期间会短暂重启，完成后自动刷新）。各实例镜像可在「管理 → 升级」单独更新。'}
           </div>
         )}
-        {isAdmin && outdatedInst > 0 && (
+        {isAdmin && (outdatedInst > 0 || remoteNewer) && (
           <div className="ver-hint">
-            ⚠️ 另有 <b>{outdatedInst}</b> 个实例的镜像可升级。<b>更新面板不会自动升级实例</b>（二者是不同镜像）——请到「管理」用「一键升级全部实例」。
+            ⚠️ {outdatedInst > 0 ? <>另有 <b>{outdatedInst}</b> 个实例的镜像可升级。</> : <>实例镜像检测到新版本。</>}
+            <b>更新面板不会自动升级实例</b>（二者是不同镜像）——请到「管理」用「一键升级全部实例」。
           </div>
         )}
         <div className="settings-actions">
@@ -329,8 +338,10 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [volumeInst, setVolumeInst] = useState<InstanceWithStatus | null>(null); // 数据卷管理弹窗
   const [iconInst, setIconInst] = useState<InstanceWithStatus | null>(null); // 图标编辑弹窗
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
-  const [upg, setUpg] = useState<{ outdatedCount: number; outdatedIds: string[] } | null>(null); // 镜像落后的实例
+  const [upg, setUpg] = useState<{ outdatedCount: number; outdatedIds: string[]; remoteNewer: boolean } | null>(null); // 镜像落后的实例 + 远端有新版
   const [upgradingAll, setUpgradingAll] = useState(false);
+  const [upgProgress, setUpgProgress] = useState(''); // 一键升级进度文案（"2/5 · 升级「xxx」…"）
+  const pollingRef = useRef(false); // 防止 load() 恢复轮询与手动发起的轮询并存
   // 未使用的旧数据卷（来自之前删实例时未勾选"彻底清除"）：允许复用以继承聊天记录，或显式删除。
   const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
   // 残留 woc-wx-* 容器（runInstance 启动失败遗留的 Created 容器等）：占着卷名让删卷报 409。
@@ -364,7 +375,9 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     }
     try {
       const s = await api.upgradeStatus();
-      setUpg({ outdatedCount: s.outdatedCount, outdatedIds: s.outdatedIds });
+      setUpg({ outdatedCount: s.outdatedCount, outdatedIds: s.outdatedIds, remoteNewer: s.remoteNewer === true });
+      // 刷新页面/重进管理页时发现后台一键升级还在跑 → 恢复进度条与轮询
+      if (s.upgradeAll.running && !pollingRef.current) void pollUpgradeAll();
     } catch {
       /* ignore：更新检测失败不影响管理页 */
     }
@@ -461,10 +474,30 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const lifecycle = async (inst: InstanceWithStatus, kind: 'stop' | 'restart' | 'upgrade') => {
     const label = kind === 'stop' ? '停止中…' : kind === 'upgrade' ? '升级中…' : '重启中…';
     setAct(inst.id, label);
-    if (kind === 'upgrade') toast('正在升级实例：拉取最新镜像并重建，可能需要几分钟，请勿离开…', 'info');
     try {
-      await (kind === 'stop' ? api.instanceStop(inst.id) : kind === 'upgrade' ? api.instanceUpgrade(inst.id) : api.instanceRestart(inst.id));
-      toast(kind === 'stop' ? '已停止' : kind === 'upgrade' ? '已升级到最新镜像并重启' : '已重启', 'ok');
+      if (kind === 'upgrade') {
+        // 升级是后端异步任务（拉镜像可能数分钟）：发起后轮询 upgradingIds 直到完成，
+        // 避免同步等待被反代掐断而误报失败（旧版实况）。
+        await api.instanceUpgrade(inst.id);
+        toast('已开始升级：拉取最新镜像并重建（后台进行）…', 'info');
+        for (let i = 0; i < 400; i++) {
+          await new Promise((res) => setTimeout(res, 3000));
+          try {
+            const s = await api.upgradeStatus();
+            if (!s.upgradingIds.includes(inst.id)) {
+              // 完成后据"是否仍落后"给结论（失败详情在面板日志）
+              if (s.outdatedIds.includes(inst.id)) toast('升级未完成，请查看「面板日志」', 'error');
+              else toast('已升级到最新镜像并重启', 'ok');
+              break;
+            }
+          } catch {
+            /* 面板短暂不可达，继续轮询 */
+          }
+        }
+      } else {
+        await (kind === 'stop' ? api.instanceStop(inst.id) : api.instanceRestart(inst.id));
+        toast(kind === 'stop' ? '已停止' : '已重启', 'ok');
+      }
       await load();
     } catch (e: any) {
       toast(e.message || '操作失败', 'error');
@@ -473,25 +506,61 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     }
   };
 
-  // 一键升级全部"镜像落后"的实例（逐个拉新镜像重建，可能几分钟）。
+  // 轮询一键升级进度直到完成（3s 一次；异常网络下最多轮 30 分钟兜底退出）。
+  // 发起升级与"刷新页面后发现后台还在跑"（load 里检测）都走这里。
+  const pollUpgradeAll = async () => {
+    if (pollingRef.current) return;
+    pollingRef.current = true;
+    setUpgradingAll(true);
+    try {
+      for (let i = 0; i < 600; i++) {
+        await new Promise((res) => setTimeout(res, 3000));
+        try {
+          const s = await api.upgradeStatus();
+          const p = s.upgradeAll;
+          if (p.running) {
+            // 拉取阶段 total=0，只显示 phase；进入逐个升级后显示 n/total
+            setUpgProgress(p.total ? `${p.done}/${p.total}${p.phase ? ` · ${p.phase}` : ''}` : p.phase || '…');
+            continue;
+          }
+          if (p.total === 0) toast('所有实例已是最新镜像', 'ok');
+          else
+            toast(
+              `升级完成：成功 ${p.total - p.failed}${p.failed ? `、失败 ${p.failed}（看面板日志）` : ''}`,
+              p.failed ? 'error' : 'ok',
+            );
+          break;
+        } catch {
+          /* 面板短暂不可达（不影响后台任务），继续轮询 */
+        }
+      }
+      await load();
+    } finally {
+      pollingRef.current = false;
+      setUpgradingAll(false);
+      setUpgProgress('');
+    }
+  };
+
+  // 一键升级全部"镜像落后"的实例。后端异步执行（先统一拉镜像、再逐个重建，可能数分钟），
+  // 这里发起后轮询 upgrade-status 里的进度，避免单个请求悬死（旧版同步等待被反馈"一直卡死"）。
   const upgradeAll = async () => {
     const n = upg?.outdatedCount || 0;
     const ok = await confirm({
-      title: `升级全部 ${n} 个可升级实例？`,
-      body: '将逐个拉取最新实例镜像并重建（数据保留），每个约十几秒到几分钟；期间这些实例会短暂重连。',
+      title: n ? `升级全部 ${n} 个可升级实例？` : '拉取新版镜像并升级全部实例？',
+      body: '后台先拉取最新实例镜像，再逐个重建（数据保留）；期间这些实例会短暂重连，可离开本页。',
       confirmText: '全部升级',
     });
     if (!ok) return;
     setUpgradingAll(true);
-    toast('正在逐个升级实例，请勿离开…', 'info');
     try {
-      const r = await api.upgradeAllInstances();
-      toast(`升级完成：成功 ${r.upgraded}${r.failed ? `、失败 ${r.failed}` : ''}`, r.failed ? 'error' : 'ok');
-      await load();
+      await api.upgradeAllInstances();
+      toast('已开始升级（后台进行，可离开本页）…', 'info');
+      await pollUpgradeAll();
     } catch (e: any) {
       toast(e.message || '升级失败', 'error');
-    } finally {
       setUpgradingAll(false);
+      setUpgProgress('');
     }
   };
 
@@ -539,14 +608,20 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                 + 新建实例
               </button>
             </div>
-            {!!upg?.outdatedCount && (
+            {!!(upg?.outdatedCount || upg?.remoteNewer) && instances.length > 0 && (
               <div className="upgrade-banner">
                 <span>
-                  有 <b>{upg.outdatedCount}</b> 个实例的镜像可升级到最新版。
+                  {upg.outdatedCount ? (
+                    <>
+                      有 <b>{upg.outdatedCount}</b> 个实例的镜像可升级到最新版。
+                    </>
+                  ) : (
+                    <>检测到实例镜像有新版本可拉取。</>
+                  )}
                   <span className="muted small">（更新面板不会自动升级实例，二者是不同镜像）</span>
                 </span>
                 <button className="btn btn-primary s-btn" disabled={upgradingAll} onClick={upgradeAll}>
-                  {upgradingAll ? '升级中…请稍候' : '一键升级全部实例'}
+                  {upgradingAll ? `升级中 ${upgProgress || '…'}` : '一键升级全部实例'}
                 </button>
               </div>
             )}

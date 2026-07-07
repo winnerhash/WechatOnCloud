@@ -145,12 +145,16 @@ if command -v xsettingsd >/dev/null 2>&1; then
         family=$(cat "$FONT_FAMILY_FILE")
         [ -n "$family" ] && XSETTINGS_FONT="$family"
     fi
+    # ⚠️ XSETTINGS 规范里 Xft/DPI 的单位是「DPI × 1024」：96 DPI 必须写 98304。
+    # 若误写 96，所有 Chromium 内核应用（系统 Chromium、微信内嵌 CEF）会把 DPI 读成 96/1024≈0.09
+    # → 缩放因子≈0 → 显示变换矩阵不可逆(transform.cc NOTREACHED) → GPU 进程连崩 → 窗口秒关/黑屏。
+    # 这曾是 v1.2.9~v1.3.1 微信打不开公众号/附件、浏览器黑屏的总根因（issue #111）。
     cat > "${XSETTINGS_CONF}" << EOF
 Xft/Antialias 1
 Xft/Hinting 1
 Xft/HintStyle "hintslight"
 Xft/RGBA "rgb"
-Xft/DPI 96
+Xft/DPI 98304
 Gtk/FontName "${XSETTINGS_FONT} 10"
 EOF
     xsettingsd --config="${XSETTINGS_CONF}" 2>/dev/null &
@@ -166,6 +170,15 @@ while [ -n "${APP_BIN:-}" ] && [ ! -x "${APP_BIN}" ]; do
     fi
     sleep 2
 done
+
+# 3.5) 清理微信崩溃转储（crashinfo）。
+# 微信内嵌浏览器崩溃时 crashpad 会往 /config/.xwechat/crashinfo 里堆 .dmp 转储与 lock/meta 文件；
+# 崩溃风暴（如 DPI bug 期间每次点公众号都崩）会让它无限膨胀吃满磁盘，且启动时反复扫描刷日志。
+# 转储仅用于事后诊断，保留 1 天足够；过期即删，防磁盘被吃。
+if [ -d /config/.xwechat/crashinfo ]; then
+    find /config/.xwechat/crashinfo -type f -mtime +1 -delete 2>/dev/null || true
+    find /config/.xwechat/crashinfo -mindepth 1 -type d -empty -delete 2>/dev/null || true
+fi
 
 # 3) 常驻拉起应用
 while true; do

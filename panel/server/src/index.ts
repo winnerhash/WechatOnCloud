@@ -45,6 +45,9 @@ import {
   upgradeInstance,
   latestInstanceImageId,
   instanceOutdated,
+  pullImage,
+  pruneDanglingImages,
+  remoteInstanceImageNewer,
   removeInstance as removeInstanceContainer,
   instanceRuntime,
   triggerWechat,
@@ -390,7 +393,7 @@ app.post('/api/instances/:id/heal', async (req, reply) => {
   lastHealAt.set(id, now);
   appendPanelLog('WARN', `实例「${inst.name}」(id=${id}) 由 ${u.username} 触发卡死自愈（VNC 连不上 → 重启容器，数据保留）`);
   try {
-    await runInstance(inst);
+    await runInstance(inst, { keepImage: true }); // 自愈=重启，幂等：沿用当前镜像，绝不隐式换版
     return { ok: true, restarted: true };
   } catch (e: any) {
     appendPanelLog('ERROR', `实例「${inst.name}」(id=${id}) 卡死自愈重启失败：${e?.message || e}`);
@@ -648,7 +651,7 @@ app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
   try {
     appendPanelLog('INFO', `重启实例「${inst.name}」(id=${inst.id})`);
-    await runInstance(inst);
+    await runInstance(inst, { keepImage: true }); // 重启必须幂等：沿用当前镜像，换镜像只走显式「升级」
     return { ok: true };
   } catch (e: any) {
     appendPanelLog('ERROR', `重启实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
@@ -656,21 +659,32 @@ app.post('/api/admin/instances/:id/restart', async (req, reply) => {
   }
 });
 
-// 升级实例（仅管理员）：拉取最新微信镜像后重建（保留数据卷）。用于把旧实例更新到新版镜像
-// （如修复"最小化丢失"等），类似「更新微信」但更新的是实例容器镜像本身。
+// 升级实例（仅管理员）：拉取最新微信镜像后重建（保留数据卷）。
+// 异步化：拉取在受限网络下可达数分钟（要等到停滞超时），同步等待会被反代在 ~60s 掐断——
+// 前端误报「升级失败」而后台其实还在跑，用户再点一次就撞出并发重建。改为：登记 → 立即返回，
+// 前端轮询 upgrade-status 的 upgradingIds 直到该实例移出。
+const upgradingIds = new Set<string>();
 app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
   const inst = findInstance((req.params as any).id);
   if (!inst) return reply.code(404).send({ error: '实例不存在' });
-  try {
-    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id})：拉取最新镜像后重建`);
-    await upgradeInstance(inst);
-    appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id}) 完成`);
-    return { ok: true };
-  } catch (e: any) {
-    appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
-    return reply.code(500).send({ error: '升级失败：' + (e?.message || e) });
-  }
+  if (upgradeAllState.running) return reply.code(409).send({ error: '「一键升级全部实例」进行中，请等它完成' });
+  if (upgradingIds.has(inst.id)) return reply.code(409).send({ error: '该实例已在升级中' });
+  upgradingIds.add(inst.id);
+  void (async () => {
+    try {
+      appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id})：拉取最新镜像后重建`);
+      await upgradeInstance(inst);
+      appendPanelLog('INFO', `升级实例「${inst.name}」(id=${inst.id}) 完成`);
+    } catch (e: any) {
+      appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
+    } finally {
+      upgradingIds.delete(inst.id);
+      // 没有其他升级在跑时顺手回收悬空旧镜像
+      if (!upgradingIds.size && !upgradeAllState.running) void pruneDanglingImages();
+    }
+  })();
+  return { ok: true, started: true };
 });
 
 // 实例镜像升级状态：哪些实例的镜像落后于本地最新镜像（用于面板"实例可升级"红点 + 一键升级）。
@@ -683,30 +697,75 @@ app.get('/api/admin/instances/upgrade-status', async (req, reply) => {
     list.map(async (inst) => ({ id: inst.id, name: inst.name, outdated: await instanceOutdated(inst, latestId) })),
   );
   const outdated = results.filter((r) => r.outdated);
-  return { known: !!latestId, outdatedCount: outdated.length, outdatedIds: outdated.map((r) => r.id), instances: results };
+  return {
+    known: !!latestId,
+    outdatedCount: outdated.length,
+    outdatedIds: outdated.map((r) => r.id),
+    instances: results,
+    // 远端 registry 是否有比本地更新的实例镜像（null=未知/离线）。补 instanceOutdated 的盲区：
+    // 用户更新面板后本地实例镜像还是旧的，仅比本地会误报"无可升级"。
+    remoteNewer: remoteInstanceImageNewer(),
+    upgradeAll: upgradeAllState, // 一键升级进行中的进度（running=false 表示空闲/已完成）
+    upgradingIds: [...upgradingIds], // 单实例升级中的实例（前端轮询用）
+  };
 });
 
-// 一键升级全部"镜像落后"的实例（顺序执行，逐个 best-effort；个别失败不影响其余）。
+// 一键升级全部"镜像落后"的实例。
+// 异步化：拉镜像 + 逐个重建可能耗时数分钟到更久（受限网络下拉取要等到停滞超时），同步等待会让
+// 前端请求悬死、代理超时——用户反馈"一键升级一直卡死"。改为：立即返回，后台顺序执行，
+// 前端轮询 upgrade-status 里的 upgradeAll 进度。
+// 顺序很关键：先拉镜像、再判定谁落后。反过来会把"本来等于旧最新版"的实例漏掉——拉取带来
+// 更新后它们才变落后，用户点完"全部升级"却发现横幅还在。
+let upgradeAllState = { running: false, total: 0, done: 0, failed: 0, phase: '' };
 app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
   if (!requireAdmin(req, reply)) return;
-  const latestId = await latestInstanceImageId();
-  if (!latestId) return reply.code(409).send({ error: '本地尚无实例镜像，无法判断是否需要升级（请先联网拉取）' });
-  const list = listInstances();
-  let upgraded = 0;
-  let failed = 0;
-  for (const inst of list) {
-    if (!(await instanceOutdated(inst, latestId))) continue;
+  if (upgradeAllState.running) return reply.code(409).send({ error: '一键升级正在进行中，请等待完成' });
+  if (upgradingIds.size) return reply.code(409).send({ error: '有实例正在单独升级，请等它完成' });
+  upgradeAllState = { running: true, total: 0, done: 0, failed: 0, phase: '拉取最新实例镜像…' };
+  void (async () => {
     try {
-      appendPanelLog('INFO', `一键升级实例「${inst.name}」(id=${inst.id})…`);
-      await upgradeInstance(inst);
-      upgraded++;
-    } catch (e: any) {
-      failed++;
-      appendPanelLog('ERROR', `一键升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
+      // ① 统一拉取一次（失败不阻断：用本地已有镜像重建）
+      try {
+        await pullImage();
+      } catch (e: any) {
+        appendPanelLog('WARN', `一键升级：拉取镜像失败（${e?.message || e}），改用本地镜像重建`);
+      }
+      // ② 拉取后再判定落后清单
+      const latestId = await latestInstanceImageId();
+      if (!latestId) {
+        appendPanelLog('ERROR', '一键升级：本地尚无实例镜像且拉取失败，无法继续');
+        return;
+      }
+      const outdated: ReturnType<typeof listInstances> = [];
+      for (const inst of listInstances()) if (await instanceOutdated(inst, latestId)) outdated.push(inst);
+      upgradeAllState.total = outdated.length;
+      if (!outdated.length) {
+        appendPanelLog('INFO', '一键升级：所有实例已是最新镜像');
+        return;
+      }
+      // ③ 逐个重建（跳过重复拉取）
+      for (const inst of outdated) {
+        upgradeAllState.phase = `升级「${inst.name}」…`;
+        upgradingIds.add(inst.id);
+        try {
+          appendPanelLog('INFO', `一键升级实例「${inst.name}」(id=${inst.id})…`);
+          await upgradeInstance(inst, { skipPull: true });
+        } catch (e: any) {
+          upgradeAllState.failed++;
+          appendPanelLog('ERROR', `一键升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
+        } finally {
+          upgradingIds.delete(inst.id);
+        }
+        upgradeAllState.done++;
+      }
+      appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgradeAllState.done - upgradeAllState.failed}、失败 ${upgradeAllState.failed}`);
+      // ④ 升级后旧镜像变悬空（<none>），顺手清理防磁盘堆积
+      await pruneDanglingImages();
+    } finally {
+      upgradeAllState = { ...upgradeAllState, running: false, phase: '' };
     }
-  }
-  appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgraded}、失败 ${failed}`);
-  return { ok: true, upgraded, failed };
+  })();
+  return { ok: true, started: true };
 });
 
 // 实例侧：设置该实例可被哪些账户访问
@@ -1241,6 +1300,16 @@ proxy.on('proxyReqWs', (proxyReq, req) => {
   const instId = (req as any)._wocInstId;
   if (instId) proxyReq.on('upgrade', () => appendInstanceLog(instId, '[vnc] 上游已接受(101) · 桌面连接建立'));
 });
+// 上游（面板→实例）套接字 TCP keepalive：客户端断网/切网（WiFi→4G、NAS 休眠）时 TCP 不会主动通知，
+// 半开死连接可挂数小时——对 KasmVNC 表现为"幽灵会话"占坑，与新连接并存是历史上 Xvnc 卡死的诱因之一。
+// 30s 探测让死连接分钟级被回收，而不是小时级。
+proxy.on('open', (proxySocket) => {
+  try {
+    proxySocket.setKeepAlive(true, 30_000);
+  } catch {
+    /* ignore */
+  }
+});
 // 兜底：剥掉 KasmVNC 401 的 WWW-Authenticate 头，避免浏览器弹出原生 Basic Auth 登录框。
 // 正常路径下我们已注入正确凭据（不会 401）；万一凭据失配，宁可桌面加载失败也绝不把登录弹窗暴露给用户。
 proxy.on('proxyRes', (proxyRes) => {
@@ -1373,6 +1442,12 @@ app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) =>
   const ip = (req.socket && req.socket.remoteAddress) || '?';
   const uname = (u as any).username || '?';
   appendInstanceLog(inst.id, `[vnc] 连接尝试 user=${uname} ip=${ip}`);
+  // 客户端侧 TCP keepalive（与上游侧成对，见 proxy.on('open')）：及时回收断网客户端留下的半开死连接
+  try {
+    socket.setKeepAlive(true, 30_000);
+  } catch {
+    /* ignore */
+  }
   const t0 = Date.now();
   socket.on('close', () => appendInstanceLog(inst.id, `[vnc] 连接关闭（持续 ${Math.round((Date.now() - t0) / 1000)}s）`));
   proxy.ws(req, socket, head, { target: instanceTarget(inst) }, (err: any) => {
@@ -1439,7 +1514,7 @@ if (WATCHDOG_ENABLED) {
     appendPanelLog('WARN', `[看门狗] 实例「${inst.name}」(id=${inst.id}) 自愈重启（${reason}）：${detail}`);
     try {
       await stopInstance(inst);
-      await runInstance(inst);
+      await runInstance(inst, { keepImage: true }); // 自愈幂等：沿用当前镜像，绝不因本地 :latest 变了就隐式升级
       healthFails.delete(inst.id);
       app.log.info(`[watchdog] ${inst.containerName} 自愈完成（${reason}）`);
     } catch (e: any) {

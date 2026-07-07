@@ -13,16 +13,44 @@
 
 import Docker from 'dockerode';
 import { appendPanelLog } from './logs.js';
+import { versionInfo } from './version.js';
 
 const docker = new Docker();
 const PANEL_NAME = process.env.WOC_PANEL_CONTAINER || 'woc-panel';
 const UPDATER_NAME = PANEL_NAME + '-updater';
 
+// 拉取（带无进度停滞超时）：NAS 受限网络下拉取流可能僵住永不结束，同步等待会让
+// 「一键更新面板」无限卡住且 updateInFlight 永远不复位。与实例镜像 pullImage 同款保护。
 function pull(ref: string): Promise<void> {
+  const STALL_MS = 1000 * 60 * Math.max(2, Number(process.env.WOC_PULL_STALL_MIN) || 5);
   return new Promise((resolve, reject) => {
     docker.pull(ref, (err: any, stream: NodeJS.ReadableStream) => {
       if (err) return reject(err);
-      docker.modem.followProgress(stream, (e: any) => (e ? reject(e) : resolve()));
+      let done = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (e: any) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        e ? reject(e) : resolve();
+      };
+      const arm = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          try {
+            (stream as any).destroy?.();
+          } catch {
+            /* ignore */
+          }
+          finish(new Error(`拉取 ${ref} ${Math.round(STALL_MS / 60000)} 分钟无进度，判定网络卡死并中止`));
+        }, STALL_MS);
+      };
+      arm();
+      docker.modem.followProgress(
+        stream,
+        (e: any) => finish(e),
+        () => arm(), // 每有进度就重置超时
+      );
     });
   });
 }
@@ -85,6 +113,11 @@ let updateInFlight = false;
 export async function triggerSelfUpdate(): Promise<{ target: string }> {
   if (updateInFlight) throw new Error('面板更新已在进行中，请稍候');
   updateInFlight = true;
+  // 兜底复位：helper 派生成功但静默失败（如 sock 权限问题）时面板存活、本标志却永远为 true，
+  // 用户从此无法重试。10 分钟后自动放开（正常成功路径面板早被重建，本定时器无意义）。
+  setTimeout(() => {
+    updateInFlight = false;
+  }, 10 * 60 * 1000).unref();
   try {
     return await doSelfUpdate();
   } catch (e) {
@@ -97,9 +130,25 @@ async function doSelfUpdate(): Promise<{ target: string }> {
   const self: any = await docker.getContainer(PANEL_NAME).inspect();
   const ref: string = self.Config.Image; // 如 docker.io/gloridust/woc-panel:latest 或 :v1.2.1
   const repo = ref.split('@')[0].replace(/:[^/:]+$/, ''); // 去 tag
-  const target = `${repo}:latest`; // 拉最新发布
-  appendPanelLog('WARN', `面板自更新：开始拉取 ${target}`);
-  await pull(target);
+  // 版本锚定（架构守则 R1）：优先拉「更新检查」宣告的那个具体版本（CI 打的裸语义化 tag，如 1.3.1），
+  // 保证用户点「更新到 v1.3.1」拿到的就是 v1.3.1，而不是拉取瞬间恰好指到别处的 :latest；
+  // 该 tag 不存在（老版本未打 tag / 私有源）再回退 :latest。
+  const latestV = versionInfo().latest; // 'v1.3.1' | null
+  const candidates = latestV ? [`${repo}:${latestV.replace(/^v/, '')}`, `${repo}:latest`] : [`${repo}:latest`];
+  let target = '';
+  let lastErr: any = null;
+  for (const cand of candidates) {
+    appendPanelLog('WARN', `面板自更新：开始拉取 ${cand}`);
+    try {
+      await pull(cand);
+      target = cand;
+      break;
+    } catch (e: any) {
+      lastErr = e;
+      appendPanelLog('WARN', `拉取 ${cand} 失败：${e?.message || e}${cand === candidates[candidates.length - 1] ? '' : '，尝试回退 tag'}`);
+    }
+  }
+  if (!target) throw lastErr || new Error('拉取面板镜像失败');
   appendPanelLog('INFO', `面板自更新：${target} 已拉取，派生 ${UPDATER_NAME} 容器重建面板（数据保留）`);
 
   const spec = { panelName: PANEL_NAME, newImage: target, oldImageId: self.Image };
