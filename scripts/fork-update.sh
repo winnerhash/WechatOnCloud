@@ -85,11 +85,17 @@ if docker ps --filter "name=${PANEL_NAME}" --filter "status=running" --format '{
   # 从宿主 /etc/environment 提取 token（cut 去 key=，tr 清掉所有空白——/etc/environment 里值可能带前导空格/\r）
   GITHUB_TOKEN=$(grep '^GITHUB_TOKEN=' /etc/environment 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
   if [ -n "$GITHUB_TOKEN" ]; then
-    if git -c "credential.helper=!f(){ echo username=winnerhash; echo password=$GITHUB_TOKEN; }; f" push myfork HEAD:woc/audio-notify 2>&1; then
-      log "Pushed to myfork woc/audio-notify"
-    else
-      err "git push myfork failed — deployment already succeeded, push skipped"
-    fi
+    # github.com 偶发 TLS 抖动，重试 3 次提高成功率
+    push_ok=0
+    for attempt in 1 2 3; do
+      if git -c "credential.helper=!f(){ echo username=winnerhash; echo password=$GITHUB_TOKEN; }; f" push myfork HEAD:woc/audio-notify 2>&1; then
+        log "Pushed to myfork woc/audio-notify (attempt $attempt)"
+        push_ok=1
+        break
+      fi
+      [ "$attempt" -lt 3 ] && { err "push attempt $attempt failed, retrying in 3s..."; sleep 3; }
+    done
+    [ "$push_ok" = 1 ] || err "git push myfork failed after 3 attempts — deployment already succeeded, push skipped"
   else
     err "GITHUB_TOKEN missing in /etc/environment — skipped push (deployment succeeded)"
   fi
