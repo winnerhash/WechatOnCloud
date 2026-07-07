@@ -57,6 +57,8 @@ async function doForkUpdate(): Promise<{ message: string }> {
       Binds: [
         sockBind,
         `${REPO_HOST_PATH}:${REPO_HOST_PATH}`,
+        // fork 自动 push 需要 GITHUB_TOKEN（宿主 /etc/environment，只读挂载）
+        '/etc/environment:/etc/environment:ro',
       ],
       NetworkMode: self.HostConfig.NetworkMode,
       RestartPolicy: { Name: 'no' },

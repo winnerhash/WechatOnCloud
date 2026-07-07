@@ -77,6 +77,20 @@ fi
 sleep 5
 if docker ps --filter "name=${PANEL_NAME}" --filter "status=running" --format '{{.Names}}' | grep -q "${PANEL_NAME}"; then
   log "Panel is running — update complete (version: ${VER})"
+
+  # ---- Step 6: Push merged result to fork remote (best-effort，不阻断已成功的部署) ----
+  log "Pushing merged result to myfork woc/audio-notify..."
+  # 从宿主 /etc/environment 提取 token（cut 去 key=，tr 清掉所有空白——/etc/environment 里值可能带前导空格/\r）
+  GITHUB_TOKEN=$(grep '^GITHUB_TOKEN=' /etc/environment 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')
+  if [ -n "$GITHUB_TOKEN" ]; then
+    if git -c "credential.helper=!f(){ echo username=winnerhash; echo password=$GITHUB_TOKEN; }; f" push myfork HEAD:woc/audio-notify 2>&1; then
+      log "Pushed to myfork woc/audio-notify"
+    else
+      err "git push myfork failed — deployment already succeeded, push skipped"
+    fi
+  else
+    err "GITHUB_TOKEN missing in /etc/environment — skipped push (deployment succeeded)"
+  fi
   exit 0
 else
   err "Panel failed to start after update"
