@@ -6,7 +6,50 @@ import zlib from 'node:zlib';
 import Docker from 'dockerode';
 import { instanceAppType, getDesktopDark, type Instance } from './store.js';
 
-const WECHAT_IMAGE = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
+// 实例镜像引用。版本耦合（架构守则 R1）：面板与实例镜像同一 release 同步出包、按同版本号
+// 互相验证——正式版面板把 :latest 改写为与自身相同的版本 tag（如 1.4.1），保证
+// 「面板 vX 管的实例镜像也是 vX」，杜绝旧面板拉到新实例镜像（或反之）产生未验证组合。
+// 用户在 env 显式指定了非 latest tag（自行锁版）则完全尊重；开发版面板（dev-*）保持 latest。
+function resolveWechatImage(): string {
+  const raw = process.env.WOC_WECHAT_IMAGE || 'ghcr.io/gloridust/wechat-on-cloud:latest';
+  const ver = (process.env.WOC_VERSION || '').trim().replace(/^v/, '');
+  if (!/^\d+\.\d+\.\d+$/.test(ver)) return raw; // 开发版/未知版本 → 保持原样
+  const noDigest = raw.split('@')[0];
+  const m = noDigest.match(/^(.*):([^/:]+)$/);
+  if (m && m[2] !== 'latest') return raw; // 用户显式锁了别的 tag → 尊重
+  const repo = m ? m[1] : noDigest;
+  return `${repo}:${ver}`;
+}
+// 注意：可被 resolveInstanceImage() 在启动时改写为 :latest 兜底（见下），故用 let。
+let WECHAT_IMAGE = resolveWechatImage();
+
+// 版本耦合的安全兜底（P0：issue #112 后续）。版本耦合让面板偏好「与自身同版本」的实例镜像 tag，
+// 但若该 tag 在本地和 registry 都不存在——典型如某次 CI 只发布了面板、实例镜像构建失败——
+// 面板就会指向一个不存在的 tag，导致：可升级检测恒空（指示器消失）、创建/升级实例拉取失败。
+// 故启动时校验一次：偏好的具体版本 tag 不可达 → 回退 :latest，保证功能永不因版本错配而瘫痪。
+let imageResolved = false;
+export async function resolveInstanceImage(): Promise<void> {
+  if (imageResolved) return;
+  imageResolved = true;
+  const preferred = WECHAT_IMAGE;
+  const tagM = preferred.split('@')[0].match(/:([^/:]+)$/);
+  if (!tagM || tagM[1] === 'latest') return; // 已是 latest 或无 tag → 无需兜底
+  try {
+    await docker.getImage(preferred).inspect();
+    return; // 本地已有该版本镜像 → 用它
+  } catch {
+    /* 本地没有，继续查 registry */
+  }
+  const ref = parseImageRef(preferred);
+  const remote = ref ? await fetchManifestDigest(ref) : null;
+  if (remote) return; // registry 上存在该版本 → 用它（ensureImage 会拉）
+  const fallback = preferred.replace(/:[^/:]+$/, ':latest');
+  appendPanelLog(
+    'WARN',
+    `实例镜像 ${preferred} 在本地与镜像仓库均不存在，回退使用 ${fallback}（很可能该版本的实例镜像未成功发布；升级/检测将基于 :latest）`,
+  );
+  WECHAT_IMAGE = fallback;
+}
 const PUID = process.env.PUID || '1000';
 const PGID = process.env.PGID || '1000';
 const TZ = process.env.TZ || 'Asia/Shanghai';
@@ -182,6 +225,7 @@ function envList(inst: Instance): string[] {
 
 // 确保微信镜像在本地存在；缺失则从 GHCR 拉取（首次新建实例时镜像通常还没拉过）。
 async function ensureImage(): Promise<void> {
+  await resolveInstanceImage(); // 版本兜底：若耦合的版本 tag 不可达则先回退 :latest
   try {
     await docker.getImage(WECHAT_IMAGE).inspect();
     return;
@@ -307,13 +351,25 @@ export async function ensureRunning(inst: Instance): Promise<void> {
 // skipPull：批量升级时由调用方先统一拉取一次，避免 N 个实例拉 N 次（受限网络下每次
 // 都要等到拉取停滞超时，表现为"一键升级卡死"）。
 export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolean }): Promise<void> {
+  let pullErr: any = null;
   if (!opts?.skipPull) {
     try {
       await pullImage();
     } catch (e: any) {
+      pullErr = e;
       console.warn('[docker] 升级时拉取镜像失败，改用本地镜像重建:', e?.message || e);
     }
   }
+  // 记录升级前镜像，用于事后判断"升级是否真的换了镜像"（issue #112：拉取失败静默回退旧镜像，
+  // 用户被告知"完成"、实际什么都没变，且无从自查）。
+  const before = await (async () => {
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      return String(info.Image || '');
+    } catch {
+      return '';
+    }
+  })();
   // 升级不改变用户的运行状态：原本停止的实例，升级（重建）后停回去，而不是悄悄拉起。
   const wasStopped = (await instanceRuntime(inst)) === 'stopped';
   await runInstance(inst);
@@ -324,6 +380,26 @@ export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolea
     } catch {
       /* 停不回去也不算失败 */
     }
+  }
+  const after = await (async () => {
+    try {
+      const info: any = await docker.getContainer(inst.containerName).inspect();
+      return String(info.Image || '');
+    } catch {
+      return '';
+    }
+  })();
+  if (pullErr && before && after === before) {
+    // 诚实汇报：拉取失败且镜像未变 = 这次"升级"没有升级任何东西。抛错让调用方按失败处理，
+    // 用户才知道要去解决网络/镜像源问题，而不是误以为已修复。
+    throw new Error(
+      `拉取新镜像失败（${pullErr?.message || pullErr}），实例仍在原镜像上重建（未升级）。请检查网络/镜像源后重试`,
+    );
+  }
+  if (before && after !== before) {
+    appendInstanceLog(inst.id, `镜像已更换：${before.slice(7, 19)} → ${after.slice(7, 19)}`);
+  } else if (!pullErr) {
+    appendInstanceLog(inst.id, '镜像已是最新，无需更换');
   }
 }
 
@@ -530,6 +606,27 @@ export async function instanceOutdated(inst: Instance, latestId: string | null):
   }
 }
 
+// 实例容器当前运行镜像的版本号（CI 打的 org.opencontainers.image.version label，如 "1.4.0"）。
+// 本地自构建镜像无该 label → 返回镜像短 id（显示为"自构建 xxxx"级别信息）；容器不存在 → null。
+// 背景（issue #112）：用户无从得知实例到底跑的哪版镜像，"以为升级了其实没有"无法自查。
+export async function instanceImageVersion(inst: Instance): Promise<string | null> {
+  try {
+    const info: any = await docker.getContainer(inst.containerName).inspect();
+    const imgId = String(info.Image || '');
+    if (!imgId) return null;
+    try {
+      const img: any = await docker.getImage(imgId).inspect();
+      const v = img?.Config?.Labels?.['org.opencontainers.image.version'];
+      if (v) return String(v);
+    } catch {
+      /* 镜像记录不可读（containerd 快照残留），退回短 id */
+    }
+    return imgId.replace(/^sha256:/, '').slice(0, 12);
+  } catch {
+    return null;
+  }
+}
+
 // ---------- 远端实例镜像新版检测 ----------
 // 盲区背景：instanceOutdated 只比「容器镜像 vs 本地镜像」。用户更新面板后，本地实例镜像
 // 往往还是旧的（没人主动 pull）→ 检测恒为"无可升级"→ 升级引导永远不出现。这里用 registry
@@ -559,16 +656,19 @@ export function remoteInstanceImageNewer(): boolean | null {
 }
 
 async function checkRemoteImageNewer(): Promise<boolean | null> {
+  const ref = parseImageRef(WECHAT_IMAGE);
+  if (!ref) return null;
   let local: any;
   try {
     local = await docker.getImage(WECHAT_IMAGE).inspect();
   } catch {
-    return null; // 本地还没有镜像：首次拉取走 ensureImage 流程，不在这里打扰
+    // 本地没有该镜像。版本耦合后这是常态：面板刚自更新到 vX，本地还只有旧版镜像、没有 :vX 的 tag。
+    // 只要远端确实存在该镜像（digest 可取）就视为「有新版可拉取」，让升级引导亮起（一键升级会先拉取）。
+    const remote = await fetchManifestDigest(ref);
+    return remote ? true : null;
   }
   const repoDigests: string[] = local.RepoDigests || [];
   if (!repoDigests.length) return null; // 本地自构建（无 registry 来源）→ 无从比较，不打扰
-  const ref = parseImageRef(WECHAT_IMAGE);
-  if (!ref) return null;
   const remote = await fetchManifestDigest(ref);
   if (!remote) return null;
   return !repoDigests.some((d) => d.endsWith('@' + remote));

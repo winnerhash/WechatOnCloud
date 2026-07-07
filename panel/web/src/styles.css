@@ -1087,6 +1087,11 @@ button {
   background: rgba(245 158 11 / 0.18);
   color: #b9770a;
 }
+.tag-muted {
+  background: rgba(128 138 157 / 0.14);
+  color: var(--muted, #6b7280);
+  font-variant-numeric: tabular-nums;
+}
 
 /* ---------- chip 多选 / 展示 ---------- */
 .field-label {

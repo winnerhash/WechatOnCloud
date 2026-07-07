@@ -66,6 +66,7 @@ export interface MemLimits {
 export interface InstanceWithStatus extends PanelInstance {
   runtime: RuntimeState;
   wechat: WechatStatus;
+  imageVersion?: string | null; // 实例镜像版本（CI 发布版如 "1.4.0"；自构建为镜像短 id；容器缺失为 null）
 }
 
 export interface VolEntry {
