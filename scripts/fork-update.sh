@@ -14,7 +14,11 @@
 set -euo pipefail
 
 REPO="${WOC_REPO_PATH:-/home/rogerwi/woc}"
-SPEC="${WOC_UPDATER_SPEC:-{}}"
+PUID="${PUID:-1000}"; PGID="${PGID:-1000}"
+# helper 以 root 跑会往 .git 写 root 属主文件，污染宿主 git 权限（曾导致 fetch permission denied）。
+# 退出前 chown .git 回宿主用户（仅 root 生效；非 root 时 no-op）。
+trap '[ "$(id -u)" = 0 ] && chown -R '"${PUID}:${PGID}"' "$REPO/.git" 2>/dev/null || true' EXIT
+SPEC="$WOC_UPDATER_SPEC"; [ -z "$SPEC" ] && SPEC='{}'
 PANEL_NAME=$(echo "$SPEC" | jq -r '.panelName // "woc-panel"')
 
 log()  { echo "[fork-update] $(date '+%H:%M:%S') $*"; }
@@ -27,6 +31,9 @@ sleep 3
 cd "$REPO"
 # helper 容器以 root 运行、仓库属主是宿主用户 → git 报 dubious ownership，需放行
 git config --global --add safe.directory "$REPO"
+# merge commit 需要 identity（helper 容器默认无 user.name/email，--no-edit 合并会失败）
+git config --global user.name "${GIT_USER:-winnerhash}"
+git config --global user.email "${GIT_EMAIL:-winnerhash@users.noreply.github.com}"
 log "Fetching upstream..."
 git fetch upstream 2>&1 || { err "git fetch upstream failed"; exit 1; }
 

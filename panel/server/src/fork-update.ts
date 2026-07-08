@@ -12,6 +12,8 @@ const docker = new Docker();
 const PANEL_NAME = process.env.WOC_PANEL_CONTAINER || 'woc-panel';
 const UPDATER_NAME = PANEL_NAME + '-fork-updater';
 const REPO_HOST_PATH = process.env.WOC_REPO_PATH || '/home/rogerwi/woc';
+// helper 容器需走宿主代理访问 github（bridge 网络 127.0.0.1 不通宿主代理，故用 host 网络 + 传 env）
+const PROXY = process.env.WOC_PROXY || 'http://127.0.0.1:7890';
 
 let updateInFlight = false;
 
@@ -47,10 +49,14 @@ async function doForkUpdate(): Promise<{ message: string }> {
     Env: [
       'WOC_UPDATER_SPEC=' + JSON.stringify(spec),
       'WOC_REPO_PATH=' + REPO_HOST_PATH,
+      // 代理（host 网络下 127.0.0.1 直达宿主 clash）—— git fetch/push 访问 github 走代理
+      'HTTP_PROXY=' + PROXY,
+      'HTTPS_PROXY=' + PROXY,
+      'NO_PROXY=localhost,127.0.0.1,::1',
     ],
     Cmd: [
       '/bin/sh', '-c',
-      'apk add --no-cache docker-cli git jq bash > /dev/null 2>&1 && '
+      "sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && apk add --no-cache docker-cli git jq bash && "
       + `bash ${REPO_HOST_PATH}/scripts/fork-update.sh`,
     ],
     HostConfig: {
@@ -60,7 +66,8 @@ async function doForkUpdate(): Promise<{ message: string }> {
         // fork 自动 push 需要 GITHUB_TOKEN（宿主 /etc/environment，只读挂载）
         '/etc/environment:/etc/environment:ro',
       ],
-      NetworkMode: self.HostConfig.NetworkMode,
+      // host 网络：helper 内 127.0.0.1 直达宿主代理（bridge 下 127.0.0.1 是容器自己，代理传不进）
+      NetworkMode: 'host',
       RestartPolicy: { Name: 'no' },
       AutoRemove: false,
     },
@@ -87,6 +94,9 @@ export async function forkUpdateStatus(): Promise<ForkUpdateStatus> {
     const info: any = await docker.getContainer(UPDATER_NAME).inspect();
     const s = info.State || {};
     if (s.Running) return { status: 'running' };
+
+    // helper 已退出（成功/失败/冲突）→ 复位锁，允许下次触发（修复：helper 失败且不重建面板时，锁曾永久卡死）
+    updateInFlight = false;
 
     const code = s.ExitCode || 0;
     // 读取最后几行日志获取详细信息
