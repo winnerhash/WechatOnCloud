@@ -476,6 +476,7 @@ button {
   margin-left: 8px;
   vertical-align: middle;
   font-weight: 600;
+  white-space: nowrap; /* 徽标整体不换行，杜绝「可升\n级」竖排 */
 }
 .tag-off {
   background: rgba(var(--danger-rgb) / 0.14);
@@ -952,7 +953,7 @@ button {
 /* ---------- 实例网格 ---------- */
 .inst-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
   gap: 14px;
   margin-bottom: 22px;
   /* 各卡片按自身内容高度，避免某张展开「管理」菜单时同行其它卡片被拉等高（显得也展开了） */
@@ -989,11 +990,30 @@ button {
   gap: 8px;
 }
 .inst-name {
+  flex: 1; /* 吃满剩余宽度，名字有充分空间，只在真的过长时才省略 */
+  min-width: 0; /* 允许在 flex 容器内收缩以触发省略号 */
   font-size: 16px;
   font-weight: 700;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 标题行的状态徽标：不参与收缩、整体不换行（此前会被挤成「在\n线」竖排） */
+.inst-head > .tag {
+  flex: none;
+  margin-left: 0;
+  white-space: nowrap;
+}
+/* 次要元数据行：可升级 / 镜像版本，独立成行、可自然换行 */
+.inst-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.inst-meta .tag {
+  margin-left: 0;
   white-space: nowrap;
 }
 .inst-sub {
@@ -1091,6 +1111,59 @@ button {
   background: rgba(128 138 157 / 0.14);
   color: var(--muted, #6b7280);
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------- 管理页三 Tab 分段选择器（牛奶布艺：凹槽 + 浮起的选中胶囊） ---------- */
+.seg-tabs {
+  display: flex;
+  gap: 4px;
+  background: var(--trough);
+  border-radius: 999px;
+  padding: 4px;
+  margin: 2px 0 18px;
+  width: fit-content;
+}
+.seg-tab {
+  position: relative;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 22px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    color 0.18s,
+    background 0.18s,
+    box-shadow 0.18s;
+}
+.seg-tab:hover {
+  color: var(--text);
+}
+.seg-tab.active {
+  background: var(--surface);
+  color: var(--wx-green);
+  box-shadow: var(--crease);
+}
+/* 角标点：该 Tab 内有待处理事项（可升级 / 有残留资源） */
+.seg-dot {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+@media (max-width: 480px) {
+  .seg-tabs {
+    width: 100%;
+  }
+  .seg-tab {
+    flex: 1;
+    padding: 8px 0;
+  }
 }
 
 /* ---------- chip 多选 / 展示 ---------- */
@@ -2529,4 +2602,37 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ========================================================================
+ * 无障碍 · Accessibility（设计系统基线，见 doc/dev/design.md）
+ * ==================================================================== */
+
+/* 键盘焦点环：牛奶布艺无边框，鼠标态靠明度区分，但键盘用户需要明确焦点提示。
+ * :focus-visible 只在键盘导航（Tab）时出现，鼠标点击不触发，不打扰日常使用。 */
+:focus-visible {
+  outline: 2px solid rgba(var(--green-rgb) / 0.85);
+  outline-offset: 2px;
+}
+/* 输入框已有绿色内环（.input:focus），不再叠加外环 */
+.input:focus-visible {
+  outline: none;
+}
+
+/* 动效降级：尊重系统「减弱动态效果」。去掉装饰性过渡/位移，
+ * 但保留加载与进度这类【必要的状态反馈】的循环动画（否则会像卡死）。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+  .spinner,
+  .wx-progress-bar.indeterminate {
+    animation-duration: 0.8s !important;
+    animation-iteration-count: infinite !important;
+  }
 }
