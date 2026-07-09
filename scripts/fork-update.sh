@@ -64,8 +64,7 @@ VER="${UPSTREAM_VER}-fork+${FORK_SHA}"
 TARGET_IMAGE="winnerhash/woc-panel:latest"
 
 log "Building panel image (version: ${VER})..."
-if ! docker build \
-  --provenance=false --sbom=false \
+if ! DOCKER_BUILDKIT=1 docker build \
   --build-arg "WOC_VERSION=${VER}" \
   -t "${TARGET_IMAGE}" \
   "${REPO}/panel" 2>&1; then
@@ -77,7 +76,13 @@ log "Image built: ${TARGET_IMAGE}"
 # ---- Step 4: Recreate panel via docker compose ----
 log "Recreating panel container..."
 cd "$REPO"
-if ! docker compose up -d panel 2>&1; then
+# 兼容临时容器内可能只有 V1 (docker-compose) 或 V2 (docker compose) 的情况
+if command -v docker-compose &> /dev/null; then
+  COMPOSE_CMD=(docker-compose)
+else
+  COMPOSE_CMD=(docker compose)
+fi
+if ! "${COMPOSE_CMD[@]}" up -d panel 2>&1; then
   err "docker compose up -d panel failed"
   exit 4
 fi

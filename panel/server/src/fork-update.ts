@@ -47,6 +47,7 @@ async function doForkUpdate(): Promise<{ message: string }> {
     name: UPDATER_NAME,
     Image: 'alpine:3.19',
     Env: [
+      'DOCKER_BUILDKIT=1',
       'WOC_UPDATER_SPEC=' + JSON.stringify(spec),
       'WOC_REPO_PATH=' + REPO_HOST_PATH,
       // 代理（host 网络下 127.0.0.1 直达宿主 clash）—— git fetch/push 访问 github 走代理
@@ -56,7 +57,7 @@ async function doForkUpdate(): Promise<{ message: string }> {
     ],
     Cmd: [
       '/bin/sh', '-c',
-      "sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && apk add --no-cache docker-cli git jq bash && "
+      "sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && apk add --no-cache docker-cli docker-cli-buildx git jq bash && "
       + `bash ${REPO_HOST_PATH}/scripts/fork-update.sh`,
     ],
     HostConfig: {

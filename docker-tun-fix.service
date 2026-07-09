@@ -1,0 +1,15 @@
+[Unit]
+Description=Fix Docker bridge routing bypass mihomo TUN
+After=woc-panel.service docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  ip rule add from 172.18.0.0/16 table main priority 400 2>/dev/null; \
+  ip rule add from 172.17.0.0/16 table main priority 401 2>/dev/null; \
+  echo "Docker bridge TUN bypass rules added"'
+
+[Install]
+WantedBy=multi-user.target
