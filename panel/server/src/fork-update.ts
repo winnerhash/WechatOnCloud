@@ -57,7 +57,7 @@ async function doForkUpdate(): Promise<{ message: string }> {
     ],
     Cmd: [
       '/bin/sh', '-c',
-      "sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && apk add --no-cache docker-cli docker-cli-buildx git jq bash && "
+      "sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && apk add --no-cache docker-cli docker-cli-buildx docker-cli-compose git jq bash && "
       + `bash ${REPO_HOST_PATH}/scripts/fork-update.sh`,
     ],
     HostConfig: {
