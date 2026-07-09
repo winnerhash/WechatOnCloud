@@ -196,6 +196,11 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
             pollRef.current = null;
             toast(`Fork 更新完成（${s.version ?? ''}），面板即将刷新…`, 'ok');
             window.setTimeout(() => window.location.reload(), 8000);
+          } else if (s.status === 'up_to_date') {
+            clearInterval(pollRef.current!);
+            pollRef.current = null;
+            setUpdating(false);
+            toast('Fork 已与上游最新代码同步，无需更新', 'ok');
           } else if (s.status === 'conflict') {
             clearInterval(pollRef.current!);
             pollRef.current = null;

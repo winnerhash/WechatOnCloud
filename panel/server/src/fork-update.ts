@@ -87,6 +87,7 @@ export type ForkUpdateStatus =
   | { status: 'idle' }
   | { status: 'running' }
   | { status: 'success'; version?: string }
+  | { status: 'up_to_date'; message?: string }
   | { status: 'conflict'; message: string }
   | { status: 'failed'; code: number; message: string };
 
@@ -112,6 +113,10 @@ export async function forkUpdateStatus(): Promise<ForkUpdateStatus> {
       return m ? m[1] : undefined;
     };
 
+    if (code === 5) {
+      // fork-update.sh: 已是最新，跳过重建
+      return { status: 'up_to_date', message: 'Fork 已与上游最新代码同步，无需更新' };
+    }
     if (code === 0) {
       return { status: 'success', version: pickVersion(tail) };
     }

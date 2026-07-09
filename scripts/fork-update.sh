@@ -43,7 +43,8 @@ REMOTE=$(git rev-parse upstream/main 2>/dev/null) || { err "cannot resolve upstr
 
 if [ "$LOCAL" = "$REMOTE" ]; then
   log "Already up to date with upstream/main"
-  # 没有新代码可合并，但仍重建面板（可能 .env 或构建参数变了）
+  log "SKIP_REBUILD"
+  exit 5
 else
   log "New upstream commits found, merging..."
   if git merge upstream/main --ff-only 2>&1; then
