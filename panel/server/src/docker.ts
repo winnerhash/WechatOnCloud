@@ -403,6 +403,56 @@ export async function upgradeInstance(inst: Instance, opts?: { skipPull?: boolea
   }
 }
 
+// 清理【旧版本 woc 镜像】：删掉不再被任何容器使用、也不是当前版本的 woc-panel / wechat-on-cloud 镜像。
+// 背景：版本耦合后面板拉的是带版本号的 tag（:1.4.5），升级到 :1.4.6 后旧的 :1.4.5 镜像仍带 tag、
+// 不是 dangling，pruneDanglingImages 清不掉 → 每个历史版本的镜像（各 1~2GB）长期堆积吃满磁盘
+// （用户反馈"历史镜像占用太多"）。这里按"无容器引用 + 非当前版本"精准删除，绝不动正在用/未升级实例的镜像。
+// 环境变量 WOC_KEEP_OLD_IMAGES=1 可关闭（想保留旧镜像便于快速回滚的用户）。
+export async function pruneOldWocImages(): Promise<void> {
+  if (process.env.WOC_KEEP_OLD_IMAGES === '1') return;
+  try {
+    // 1) 要保留的镜像 id 集合：当前实例镜像 + 面板自身镜像 + 所有现存容器（含已停止）在用的镜像。
+    const keep = new Set<string>();
+    const curInstance = await latestInstanceImageId();
+    if (curInstance) keep.add(curInstance);
+    try {
+      const panelC: any = await docker.getContainer(process.env.WOC_PANEL_CONTAINER || 'woc-panel').inspect();
+      if (panelC?.Image) keep.add(String(panelC.Image));
+    } catch {
+      /* 面板容器名不同/查不到 → 跳过，下面的容器遍历仍会覆盖到 */
+    }
+    const containers: any[] = await docker.listContainers({ all: true });
+    for (const c of containers) if (c?.ImageID) keep.add(String(c.ImageID));
+
+    // 2) 识别 woc 镜像的仓库路径（从 WECHAT_IMAGE 推断 owner，兼容 ghcr/docker.io/无前缀各种 tag 写法）。
+    const ref = parseImageRef(WECHAT_IMAGE);
+    const owner = ref?.repo.split('/').slice(0, -1).join('/') || 'gloridust';
+    const panelRepo = process.env.WOC_PANEL_REPO || 'woc-panel';
+    const wocRepoNeedles = [`${owner}/wechat-on-cloud`, `${owner}/${panelRepo}`];
+
+    // 3) 遍历本地镜像，删掉"属于 woc 仓库 + 不在 keep 集"的。
+    const images: any[] = await docker.listImages();
+    let removed = 0;
+    for (const img of images) {
+      const tags: string[] = img.RepoTags || [];
+      if (!tags.some((t) => wocRepoNeedles.some((n) => t.includes(n)))) continue; // 非 woc 镜像
+      if (keep.has(String(img.Id))) continue; // 当前/在用 → 保留
+      try {
+        await docker.getImage(img.Id).remove({ force: true }); // force：一次删掉该镜像的所有 tag
+        removed++;
+        appendPanelLog('INFO', `清理旧版本镜像 ${tags.join(', ') || String(img.Id).slice(7, 19)}`);
+      } catch {
+        /* 仍被占用等 → 跳过，不影响其它 */
+      }
+    }
+    if (removed > 0) appendPanelLog('INFO', `已清理 ${removed} 个旧版本 woc 镜像`);
+  } catch (e: any) {
+    console.warn('[docker] 清理旧版本镜像失败（忽略）:', e?.message || e);
+  }
+  // 顺带清一次悬空层（删旧镜像后可能又暴露出无 tag 的中间层）
+  await pruneDanglingImages();
+}
+
 // 清理悬空（dangling）镜像：升级后旧实例镜像失去 tag 变成 <none>，长期堆积吃磁盘
 // （每层 1-2GB，多次升级后可观）。只删无 tag 且无容器引用的镜像，安全。best-effort。
 export async function pruneDanglingImages(): Promise<void> {

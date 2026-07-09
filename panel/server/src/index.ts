@@ -47,6 +47,7 @@ import {
   instanceOutdated,
   pullImage,
   pruneDanglingImages,
+  pruneOldWocImages,
   remoteInstanceImageNewer,
   resolveInstanceImage,
   removeInstance as removeInstanceContainer,
@@ -729,8 +730,8 @@ app.post('/api/admin/instances/:id/upgrade', async (req, reply) => {
       appendPanelLog('ERROR', `升级实例「${inst.name}」(id=${inst.id}) 失败：${e?.message || e}`);
     } finally {
       upgradingIds.delete(inst.id);
-      // 没有其他升级在跑时顺手回收悬空旧镜像
-      if (!upgradingIds.size && !upgradeAllState.running) void pruneDanglingImages();
+      // 没有其他升级在跑时顺手回收旧版本镜像（含带 tag 的历史版本，非仅悬空）
+      if (!upgradingIds.size && !upgradeAllState.running) void pruneOldWocImages();
     }
   })();
   return { ok: true, started: true };
@@ -808,8 +809,8 @@ app.post('/api/admin/instances/upgrade-all', async (req, reply) => {
         upgradeAllState.done++;
       }
       appendPanelLog('INFO', `一键升级全部实例完成：成功 ${upgradeAllState.done - upgradeAllState.failed}、失败 ${upgradeAllState.failed}`);
-      // ④ 升级后旧镜像变悬空（<none>），顺手清理防磁盘堆积
-      await pruneDanglingImages();
+      // ④ 升级后清理旧版本镜像（含带 tag 的历史版本）防磁盘堆积
+      await pruneOldWocImages();
     } finally {
       upgradeAllState = { ...upgradeAllState, running: false, phase: '' };
     }
@@ -1516,6 +1517,11 @@ for (const pub of listInstances()) {
     app.log.warn(`[instance] 启动实例 ${pub.id} 失败: ${e?.message || e}`);
   }
 }
+
+// 启动时清一次旧版本 woc 镜像：面板自更新会留下旧的 woc-panel 镜像（helper 用新镜像重建面板后，
+// 旧镜像不再被任何容器引用，但带 tag 不是 dangling，清不掉）——在这里回收，也作为周期性兜底。
+// 延迟 30s 执行，避开启动高峰（拉实例镜像 / 起容器）。
+setTimeout(() => void pruneOldWocImages(), 30_000).unref();
 
 // Watchdog：KasmVNC/Xvnc 长跑会泄漏（实测 24h 可达 ~9 GiB），小内存机器会被拖垮。
 // 两档阈值，按"是否有人在用"决定时机：
