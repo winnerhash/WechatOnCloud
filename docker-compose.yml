@@ -46,12 +46,15 @@ services:
       - PANEL_ALLOWED_HOSTS=${PANEL_ALLOWED_HOSTS:-}
       # Fork 配置：仓库宿主路径（fork 更新 helper 需要此值来挂载 repo 目录）
       - WOC_REPO_PATH=${WOC_REPO_PATH:-/home/rogerwi/woc}
+      # 代理（面板 bridge 网络下通过 docker0 网关 172.17.0.1 访问宿主 clash；不能继承宿主 127.0.0.1）
+      - HTTP_PROXY=http://172.17.0.1:7890
+      - HTTPS_PROXY=http://172.17.0.1:7890
 
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）
       - ./data-panel:/data
       # 前端静态文件（开发模式直接覆盖，无需 docker cp）
-      - ./panel/web/dist:/app/web-dist
+      #- ./panel/web/dist:/app/web-dist
       # 面板经 docker 引擎创建/启动/删除微信实例容器、exec 触发下载、读取进度。
       # 注意：docker.sock 等同宿主 root 权限，故实例增删仅限管理员，docker API 绝不暴露给前端。
       - /var/run/docker.sock:/var/run/docker.sock

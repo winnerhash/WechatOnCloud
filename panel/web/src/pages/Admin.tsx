@@ -285,7 +285,7 @@ function AboutSection({ isAdmin }: { isAdmin: boolean }) {
           </div>
         )}
         <div className="settings-actions">
-          {info?.hasUpdate && isAdmin && (
+          {isAdmin && (info?.hasUpdate || isFork) && (
             <button className="btn btn-primary s-btn" disabled={updating} onClick={isFork ? forkUpdate : selfUpdate}>
               {updating ? '更新中…请稍候'
                 : isFork ? '合并上游更新'
