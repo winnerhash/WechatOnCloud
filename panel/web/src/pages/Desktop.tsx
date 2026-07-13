@@ -704,6 +704,16 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
+  const fixExt = async (name: string, ext: string) => {
+    try {
+      await api.renameTransferFile(name, name + ext);
+      toast(`已补后缀：${name}${ext}`, 'ok');
+      refreshTransferFiles(transferSearch || undefined);
+    } catch (e: any) {
+      toast(e.message || '补后缀失败', 'error');
+    }
+  };
+
   // ---------- 桌面壁纸 ----------
   const refreshBgList = async () => {
     if (!id) return;
@@ -1255,10 +1265,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                 )}
                 {transferFiles.map((f) => (
                   <div key={f.name} className="files-item">
-                    <a className="files-dl" href={api.downloadTransferFileUrl(f.name)} download={f.name} title="下载">
+                    <a className="files-dl" href={api.downloadTransferFileUrl(f.name)} download={f.detectedExt ? f.name + f.detectedExt : f.name} title="下载">
                       <span className="files-name">{f.name}</span>
                       <span className="files-size">{humanSize(f.size)} ↓</span>
                     </a>
+                    {'detectedExt' in f && f.detectedExt && (
+                      <button className="files-ext" title={`补后缀 ${f.detectedExt}`} onClick={() => fixExt(f.name, f.detectedExt!)}>
+                        +{f.detectedExt}
+                      </button>
+                    )}
                     <button className="files-del" title="删除" onClick={() => delTransferFile(f.name)}>
                       ✕
                     </button>

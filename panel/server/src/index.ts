@@ -99,7 +99,7 @@ import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { triggerForkUpdate, forkUpdateStatus } from './fork-update.js';
-import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile } from './transfer.js';
+import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile, renameTransferFile } from './transfer.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -948,6 +948,21 @@ app.delete('/api/transfer/files', async (req, reply) => {
     return { ok: true };
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '删除失败' });
+  }
+});
+
+// 补后缀（重命名文件，如 IMG_2907 → IMG_2907.png）
+app.post('/api/transfer/rename', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const oldName = String((req.body as any)?.oldName || '').trim();
+  const newName = String((req.body as any)?.newName || '').trim();
+  try {
+    renameTransferFile(oldName, newName);
+    appendPanelLog('INFO', `互传重命名：${u.username} ${oldName} → ${newName}`);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '重命名失败' });
   }
 });
 

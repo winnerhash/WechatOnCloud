@@ -261,6 +261,8 @@ export const api = {
   downloadTransferFileUrl: (name: string) => `/api/transfer/download?name=${encodeURIComponent(name)}`,
   deleteTransferFile: (name: string) =>
     req(`/api/transfer/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  renameTransferFile: (oldName: string, newName: string) =>
+    req(`/api/transfer/rename`, { method: 'POST', body: JSON.stringify({ oldName, newName }) }),
 
   // 数据卷管理（仅管理员）
   volumeList: (id: string, path = '') =>
