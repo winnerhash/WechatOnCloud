@@ -931,6 +931,7 @@ app.get('/api/transfer/download', async (req, reply) => {
     reply.header('content-type', 'application/octet-stream');
     reply.header('content-length', String(size));
     reply.header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+    reply.header('X-Accel-Buffering', 'no');
     return reply.send(stream);
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '下载失败' });
