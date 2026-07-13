@@ -99,7 +99,7 @@ import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { triggerForkUpdate, forkUpdateStatus } from './fork-update.js';
-import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile, renameTransferFile, detectFileTypes } from './transfer.js';
+import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, readTransferFileBuffer, deleteTransferFile, renameTransferFile, detectFileTypes } from './transfer.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -971,6 +971,26 @@ app.get('/api/transfer/detect', async (req, reply) => {
   const u = requireAuth(req, reply);
   if (!u) return;
   return { results: detectFileTypes() };
+});
+
+// 移动互传文件到微信实例桌面
+app.post('/api/transfer/to-instance', { bodyLimit: 512 * 1024 * 1024 }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const name = String((req.body as any)?.name || '').trim();
+  const instanceId = String((req.body as any)?.instanceId || '').trim();
+  if (!name || !instanceId) return reply.code(400).send({ error: '缺少参数' });
+  const inst = findInstance(instanceId);
+  if (!inst) return reply.code(404).send({ error: '实例不存在' });
+  if (!userCanAccess(u, instanceId)) return reply.code(403).send({ error: '无权访问该实例' });
+  try {
+    const content = readTransferFileBuffer(name);
+    await uploadToInstance(inst, name, content);
+    appendPanelLog('INFO', `互传→实例：${u.username} 将 ${name} 移到 ${inst.name} 桌面`);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '移动失败' });
+  }
 });
 
 // ---------- 多端协作：操作控制权（心跳软锁，避免多人同时操作打架） ----------

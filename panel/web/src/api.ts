@@ -264,6 +264,8 @@ export const api = {
   renameTransferFile: (oldName: string, newName: string) =>
     req(`/api/transfer/rename`, { method: 'POST', body: JSON.stringify({ oldName, newName }) }),
   detectTransferTypes: () => req<{ results: { name: string; ext: string }[] }>('/api/transfer/detect'),
+  moveTransferToInstance: (name: string, instanceId: string) =>
+    req('/api/transfer/to-instance', { method: 'POST', body: JSON.stringify({ name, instanceId }) }),
 
   // 数据卷管理（仅管理员）
   volumeList: (id: string, path = '') =>

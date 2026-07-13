@@ -122,6 +122,14 @@ export function readTransferFileStream(name: string): { stream: NodeJS.ReadableS
   return { stream: createReadStream(filePath), size: stat.size };
 }
 
+// 读取整个文件到内存（用于移动到实例容器）
+export function readTransferFileBuffer(name: string): Buffer {
+  if (!safeName(name)) throw new Error('文件名不合法');
+  const filePath = join(TRANSFER_DIR, name);
+  if (!existsSync(filePath)) throw new Error('文件不存在');
+  return readFileSync(filePath);
+}
+
 // 删除文件
 export function deleteTransferFile(name: string): void {
   if (!safeName(name)) throw new Error('文件名不合法');

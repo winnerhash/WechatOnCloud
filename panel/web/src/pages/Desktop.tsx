@@ -732,6 +732,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
+  const moveToInstance = async (name: string) => {
+    try {
+      await api.moveTransferToInstance(name, id);
+      toast(`已将 ${name} 移到微信桌面`, 'ok');
+    } catch (e: any) {
+      toast(e.message || '移动失败', 'error');
+    }
+  };
+
   // ---------- 桌面壁纸 ----------
   const refreshBgList = async () => {
     if (!id) return;
@@ -1297,6 +1306,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                         +{ext}
                       </button>
                     )}
+                    <button className="files-move" title="移到微信桌面" onClick={() => moveToInstance(f.name)}>
+                      →微信
+                    </button>
                     <button className="files-del" title="删除" onClick={() => delTransferFile(f.name)}>
                       ✕
                     </button>

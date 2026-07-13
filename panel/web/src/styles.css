@@ -938,6 +938,20 @@ button {
 .files-ext:active {
   background: rgba(7, 193, 96, 0.2);
 }
+.files-move {
+  flex: none;
+  padding: 2px 6px;
+  border: none;
+  background: none;
+  color: var(--wx-green, #07C160);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 6px;
+}
+.files-move:active {
+  background: rgba(7, 193, 96, 0.12);
+}
 .files-del {
   flex: none;
   width: 30px;
