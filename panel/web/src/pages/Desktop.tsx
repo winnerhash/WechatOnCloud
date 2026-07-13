@@ -152,6 +152,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [dragging, setDragging] = useState(false);
   const [showFiles, setShowFiles] = useState(false);
   const [files, setFiles] = useState<TFile[]>([]);
+  const [showTransfer, setShowTransfer] = useState(false);
+  const [transferFiles, setTransferFiles] = useState<TFile[]>([]);
+  const [transferSearch, setTransferSearch] = useState('');
+  const [transferUploading, setTransferUploading] = useState(false);
+  const transferInput = useRef<HTMLInputElement>(null);
   const [showClip, setShowClip] = useState(false);
   const [clipText, setClipText] = useState('');
   // 中文输入模式：'forward'=底部输入条转发（默认，最稳）；'seamless'=无感（直接在微信里打，提交后转发）。
@@ -258,6 +263,9 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     setLoadStuck(false);
     setShowFiles(false);
     setFiles([]);
+    setShowTransfer(false);
+    setTransferFiles([]);
+    setTransferSearch('');
     setShowClip(false);
     setClipText('');
     setImeText('');
@@ -657,6 +665,45 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     }
   };
 
+  // ---------- 互传（宿主文件） ----------
+  const refreshTransferFiles = async (search?: string) => {
+    try {
+      const { files } = await api.listTransferFiles(search);
+      setTransferFiles(files);
+    } catch { /* ignore */ }
+  };
+
+  const uploadTransferFiles = async (list: FileList | File[]) => {
+    const arr = Array.from(list);
+    if (!arr.length) return;
+    setTransferUploading(true);
+    let ok = 0;
+    for (const f of arr) {
+      try {
+        await api.uploadTransferFile(f);
+        ok++;
+      } catch (e: any) {
+        toast(`${f.name}: ${e.message || '上传失败'}`, 'error');
+      }
+    }
+    setTransferUploading(false);
+    if (ok) {
+      toast(`已上传 ${ok} 个文件到互传目录`, 'ok');
+      refreshTransferFiles(transferSearch || undefined);
+    }
+  };
+
+  const delTransferFile = async (name: string) => {
+    if (!(await confirm({ title: `删除「${name}」？`, body: '将从宿主互传目录中删除该文件。', danger: true, confirmText: '删除' }))) return;
+    try {
+      await api.deleteTransferFile(name);
+      toast('已删除', 'ok');
+      refreshTransferFiles(transferSearch || undefined);
+    } catch (e: any) {
+      toast(e.message || '删除失败', 'error');
+    }
+  };
+
   // ---------- 桌面壁纸 ----------
   const refreshBgList = async () => {
     if (!id) return;
@@ -904,6 +951,17 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
         {showVnc && (
           <>
             <button
+              className={'ws-action' + (showTransfer ? ' on' : '')}
+              title="互传：与宿主机交换文件"
+              onClick={() => {
+                setShowTransfer((v) => !v);
+                setShowFiles(false);
+                if (!showTransfer) refreshTransferFiles();
+              }}
+            >
+              互传
+            </button>
+            <button
               className="ws-action"
               title="文件传输"
               onClick={() => {
@@ -1149,6 +1207,59 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                       <span className="files-size">{humanSize(f.size)} ↓</span>
                     </a>
                     <button className="files-del" title="删除" onClick={() => delFile(f.name)}>
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {showTransfer && (
+            <div className="iv-files">
+              <div className="files-head">
+                <span>互传</span>
+                <button className="btn-text" onClick={() => setShowTransfer(false)}>
+                  关闭
+                </button>
+              </div>
+              <input
+                ref={transferInput}
+                type="file"
+                multiple
+                style={{ display: 'none' }}
+                onChange={(e) => {
+                  if (e.target.files) uploadTransferFiles(e.target.files);
+                  e.target.value = '';
+                }}
+              />
+              <button className="btn btn-primary files-upload" disabled={transferUploading} onClick={() => transferInput.current?.click()}>
+                {transferUploading ? '上传中…' : '＋ 上传到互传目录'}
+              </button>
+              <input
+                className="transfer-search"
+                type="text"
+                placeholder="搜索文件…"
+                value={transferSearch}
+                onChange={(e) => {
+                  setTransferSearch(e.target.value);
+                  refreshTransferFiles(e.target.value || undefined);
+                }}
+              />
+              <div className="files-hint">文件存储在宿主机 /home/rogerwi/uploads/ 目录，iOS 快捷指令等外部工具也可直接写入。</div>
+              <div className="files-list">
+                {transferFiles.length === 0 && (
+                  <div className="muted small" style={{ padding: '10px 2px' }}>
+                    {transferSearch ? '无匹配文件' : '暂无文件'}
+                  </div>
+                )}
+                {transferFiles.map((f) => (
+                  <div key={f.name} className="files-item">
+                    <a className="files-dl" href={api.downloadTransferFileUrl(f.name)} download={f.name} title="下载">
+                      <span className="files-name">{f.name}</span>
+                      <span className="files-size">{humanSize(f.size)} ↓</span>
+                    </a>
+                    <button className="files-del" title="删除" onClick={() => delTransferFile(f.name)}>
                       ✕
                     </button>
                   </div>

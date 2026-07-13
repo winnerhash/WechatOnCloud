@@ -49,6 +49,8 @@ services:
       # 代理（面板 bridge 网络下通过 docker0 网关 172.17.0.1 访问宿主 clash；不能继承宿主 127.0.0.1）
       - HTTP_PROXY=http://172.17.0.1:7890
       - HTTPS_PROXY=http://172.17.0.1:7890
+      # 互传：宿主机文件中转目录（iOS 快捷指令等外部工具写入，面板内浏览/下载）
+      - WOC_TRANSFER_DIR=/data/uploads
 
     volumes:
       # 面板账号数据（用户、实例元信息、密码哈希）
@@ -61,6 +63,8 @@ services:
       # 摄像头自动探测（可选）：把宿主 /dev 只读挂进来，面板据此发现 /dev/videoN 并映射给实例。
       # 不想自动探测就删掉此行，改用上面的 WOC_VIDEO_DEVICES 显式指定。
       - /dev:/host-dev:ro
+      # 互传：宿主机文件中转目录（面板内通过 /data/uploads 读写）
+      - /home/rogerwi/uploads:/data/uploads
 
     ports:
       - "${WOC_HTTP_PORT:-36080}:8080"   # 面板 = 唯一对外入口

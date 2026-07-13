@@ -243,6 +243,25 @@ export const api = {
   downloadFileUrl: (id: string, name: string) => `/api/instances/${id}/download?name=${encodeURIComponent(name)}`,
   deleteFile: (id: string, name: string) => req(`/api/instances/${id}/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
 
+  // 互传（宿主文件中转）
+  listTransferFiles: (search?: string) =>
+    req<{ files: { name: string; size: number; mtime: number }[] }>(
+      `/api/transfer/files${search ? `?search=${encodeURIComponent(search)}` : ''}`,
+    ),
+  uploadTransferFile: async (file: File) => {
+    const res = await fetch(`/api/transfer/upload?name=${encodeURIComponent(file.name)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/octet-stream' },
+      body: file,
+    });
+    if (!res.ok) throw new Error(((await res.json().catch(() => ({}))) as any).error || '上传失败');
+    return res.json();
+  },
+  downloadTransferFileUrl: (name: string) => `/api/transfer/download?name=${encodeURIComponent(name)}`,
+  deleteTransferFile: (name: string) =>
+    req(`/api/transfer/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
   // 数据卷管理（仅管理员）
   volumeList: (id: string, path = '') =>
     req<{ path: string; entries: VolEntry[] }>(`/api/admin/instances/${id}/volume?path=${encodeURIComponent(path)}`),

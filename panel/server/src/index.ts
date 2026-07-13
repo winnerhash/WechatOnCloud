@@ -99,6 +99,7 @@ import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { triggerForkUpdate, forkUpdateStatus } from './fork-update.js';
+import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile } from './transfer.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -118,6 +119,7 @@ function basicAuth(inst: Instance) {
 }
 
 initStore();
+ensureTransferDir();
 
 const app = Fastify({ logger: true, trustProxy: true, bodyLimit: 50 * 1024 * 1024 });
 
@@ -891,6 +893,61 @@ app.get('/api/instances/:id/download', async (req, reply) => {
     return reply.send(buf);
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '下载失败' });
+  }
+});
+
+// ---------- 互传（宿主文件中转：任何登录用户可用） ----------
+// 列出互传目录中的文件（可选 ?search=xxx 服务端过滤）
+app.get('/api/transfer/files', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const search = String((req.query as any)?.search || '').trim() || undefined;
+  return { files: listTransferFiles(search) };
+});
+
+// 上传文件到互传目录（原始二进制直传，复用全局 octet-stream parser）
+app.post('/api/transfer/upload', { bodyLimit: 512 * 1024 * 1024 }, async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const name = String((req.query as any)?.name || '').trim();
+  const body = req.body as Buffer;
+  if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: '空文件或格式错误' });
+  try {
+    writeTransferFile(name, body);
+    appendPanelLog('INFO', `互传上传：${u.username} 上传 ${name}（${(body.length / 1024).toFixed(0)} KB）`);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '上传失败' });
+  }
+});
+
+// 下载互传目录中的文件（流式传输，不全部载入内存）
+app.get('/api/transfer/download', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const name = String((req.query as any)?.name || '').trim();
+  try {
+    const { stream, size } = readTransferFileStream(name);
+    reply.header('content-type', 'application/octet-stream');
+    reply.header('content-length', String(size));
+    reply.header('content-disposition', `attachment; filename*=UTF-8''${encodeURIComponent(name)}`);
+    return reply.send(stream);
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '下载失败' });
+  }
+});
+
+// 删除互传目录中的文件
+app.delete('/api/transfer/files', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const name = String((req.query as any)?.name || '').trim();
+  try {
+    deleteTransferFile(name);
+    appendPanelLog('INFO', `互传删除：${u.username} 删除 ${name}`);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(400).send({ error: e?.message || '删除失败' });
   }
 });
 
