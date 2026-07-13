@@ -11,7 +11,6 @@ export interface TransferFile {
   name: string;
   size: number;
   mtime: number; // epoch ms
-  detectedExt?: string; // 无后缀文件自动检测到的扩展名
 }
 
 function safeName(name: string): boolean {
@@ -70,16 +69,15 @@ function detectExt(name: string, filePath: string): string | undefined {
   return undefined;
 }
 
-// 列出文件（按时间倒序），支持搜索过滤，无后缀文件自动检测类型
+// 列出文件（按时间倒序），支持搜索过滤
 export function listTransferFiles(search?: string): TransferFile[] {
   if (!existsSync(TRANSFER_DIR)) return [];
   try {
     let files = readdirSync(TRANSFER_DIR, { withFileTypes: true })
       .filter(e => e.isFile())
       .map(e => {
-        const filePath = join(TRANSFER_DIR, e.name);
-        const stat = statSync(filePath);
-        return { name: e.name, size: stat.size, mtime: stat.mtimeMs, detectedExt: detectExt(e.name, filePath) };
+        const stat = statSync(join(TRANSFER_DIR, e.name));
+        return { name: e.name, size: stat.size, mtime: stat.mtimeMs };
       })
       .sort((a, b) => b.mtime - a.mtime);
     if (search) {
@@ -87,6 +85,22 @@ export function listTransferFiles(search?: string): TransferFile[] {
       files = files.filter(f => f.name.toLowerCase().includes(q));
     }
     return files;
+  } catch {
+    return [];
+  }
+}
+
+// 手动检测所有无后缀文件的类型（点击"检测类型"按钮时调用）
+export function detectFileTypes(): { name: string; ext: string }[] {
+  if (!existsSync(TRANSFER_DIR)) return [];
+  try {
+    return readdirSync(TRANSFER_DIR, { withFileTypes: true })
+      .filter(e => e.isFile() && !extname(e.name))
+      .map(e => {
+        const ext = detectExt(e.name, join(TRANSFER_DIR, e.name));
+        return ext ? { name: e.name, ext } : null;
+      })
+      .filter(Boolean) as { name: string; ext: string }[];
   } catch {
     return [];
   }

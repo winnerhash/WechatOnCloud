@@ -263,6 +263,7 @@ export const api = {
     req(`/api/transfer/files?name=${encodeURIComponent(name)}`, { method: 'DELETE' }),
   renameTransferFile: (oldName: string, newName: string) =>
     req(`/api/transfer/rename`, { method: 'POST', body: JSON.stringify({ oldName, newName }) }),
+  detectTransferTypes: () => req<{ results: { name: string; ext: string }[] }>('/api/transfer/detect'),
 
   // 数据卷管理（仅管理员）
   volumeList: (id: string, path = '') =>

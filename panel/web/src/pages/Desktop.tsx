@@ -156,6 +156,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [transferFiles, setTransferFiles] = useState<TFile[]>([]);
   const [transferSearch, setTransferSearch] = useState('');
   const [transferUploading, setTransferUploading] = useState(false);
+  const [transferDetected, setTransferDetected] = useState<Record<string, string>>({});
   const transferInput = useRef<HTMLInputElement>(null);
   const [showClip, setShowClip] = useState(false);
   const [clipText, setClipText] = useState('');
@@ -266,6 +267,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     setShowTransfer(false);
     setTransferFiles([]);
     setTransferSearch('');
+    setTransferDetected({});
     setShowClip(false);
     setClipText('');
     setImeText('');
@@ -708,9 +710,25 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     try {
       await api.renameTransferFile(name, name + ext);
       toast(`已补后缀：${name}${ext}`, 'ok');
+      const next = { ...transferDetected };
+      delete next[name];
+      setTransferDetected(next);
       refreshTransferFiles(transferSearch || undefined);
     } catch (e: any) {
       toast(e.message || '补后缀失败', 'error');
+    }
+  };
+
+  const detectTypes = async () => {
+    try {
+      const { results } = await api.detectTransferTypes();
+      const map: Record<string, string> = {};
+      for (const r of results) map[r.name] = r.ext;
+      setTransferDetected(map);
+      if (results.length === 0) toast('所有文件都已有后缀', 'ok');
+      else toast(`检测到 ${results.length} 个无后缀文件`, 'ok');
+    } catch (e: any) {
+      toast(e.message || '检测失败', 'error');
     }
   };
 
@@ -1256,29 +1274,35 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                   refreshTransferFiles(e.target.value || undefined);
                 }}
               />
-              <div className="files-hint">文件存储在宿主机 /home/rogerwi/uploads/ 目录，iOS 快捷指令等外部工具也可直接写入。</div>
+              <div className="files-hint">
+                <button className="btn-text" style={{ padding: 0, fontSize: 'inherit' }} onClick={detectTypes}>🔍 检测类型</button>
+                {' '}（识别无后缀文件，如 PNG/JPG/PDF 等）
+              </div>
               <div className="files-list">
                 {transferFiles.length === 0 && (
                   <div className="muted small" style={{ padding: '10px 2px' }}>
                     {transferSearch ? '无匹配文件' : '暂无文件'}
                   </div>
                 )}
-                {transferFiles.map((f) => (
+                {transferFiles.map((f) => {
+                  const ext = transferDetected[f.name];
+                  return (
                   <div key={f.name} className="files-item">
-                    <a className="files-dl" href={api.downloadTransferFileUrl(f.name)} download={f.detectedExt ? f.name + f.detectedExt : f.name} title="下载">
+                    <a className="files-dl" href={api.downloadTransferFileUrl(f.name)} download={ext ? f.name + ext : f.name} title="下载">
                       <span className="files-name">{f.name}</span>
                       <span className="files-size">{humanSize(f.size)} ↓</span>
                     </a>
-                    {'detectedExt' in f && f.detectedExt && (
-                      <button className="files-ext" title={`补后缀 ${f.detectedExt}`} onClick={() => fixExt(f.name, f.detectedExt!)}>
-                        +{f.detectedExt}
+                    {ext && (
+                      <button className="files-ext" title={`补后缀 ${ext}`} onClick={() => fixExt(f.name, ext)}>
+                        +{ext}
                       </button>
                     )}
                     <button className="files-del" title="删除" onClick={() => delTransferFile(f.name)}>
                       ✕
                     </button>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

@@ -99,7 +99,7 @@ import { parseHost, parseAllowedHosts, isRequestHostAllowed } from './host-guard
 import { CURRENT_VERSION, versionInfo, ensureChecked, checkForUpdate, startUpdateChecker } from './version.js';
 import { triggerSelfUpdate } from './self-update.js';
 import { triggerForkUpdate, forkUpdateStatus } from './fork-update.js';
-import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile, renameTransferFile } from './transfer.js';
+import { ensureTransferDir, listTransferFiles, writeTransferFile, readTransferFileStream, deleteTransferFile, renameTransferFile, detectFileTypes } from './transfer.js';
 import { appendInstanceLog, readInstanceLog, appendPanelLog, readPanelLog, pruneOldLogs, filterSince, rangeToMs, DIAG_RANGES } from './logs.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -964,6 +964,13 @@ app.post('/api/transfer/rename', async (req, reply) => {
   } catch (e: any) {
     return reply.code(400).send({ error: e?.message || '重命名失败' });
   }
+});
+
+// 检测所有无后缀文件的类型（手动触发）
+app.get('/api/transfer/detect', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  return { results: detectFileTypes() };
 });
 
 // ---------- 多端协作：操作控制权（心跳软锁，避免多人同时操作打架） ----------
