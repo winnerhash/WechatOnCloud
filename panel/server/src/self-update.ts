@@ -55,6 +55,15 @@ function pull(ref: string): Promise<void> {
   });
 }
 
+// 【镜像身份】env：属于"这个镜像是哪一版"，绝不能从旧容器继承，必须永远取新镜像 baked 值。
+// 教训（issue #107，用户反馈"一键更新到了 1.2.7"）：下面的 env-diff 用"容器值 != 旧镜像 baked 值"
+// 判定为"compose 注入、需保留"。但 WOC_VERSION 一旦偏离（旧镜像 inspect 失败 → oldBaked 为空，
+// 于是【所有】容器 env 都被当成注入而保留），新面板就会顶着旧版本号跑新代码：自报 v1.2.7、
+// 点"更新"后还是 v1.2.7。更糟的是【自我延续】——偏离之后，容器值与新镜像 baked 值永远不等，
+// 每次自更新都再次判定为"注入"并保留，用户永远出不来（只能手删容器重建）。
+// 还会连累版本耦合（resolveWechatImage 读 WOC_VERSION）去找不存在的 wechat-on-cloud:<旧版本>。
+const IMAGE_IDENTITY_ENV = new Set(['WOC_VERSION']);
+
 function envToMap(env?: string[] | null): Map<string, string> {
   const m = new Map<string, string>();
   for (const e of env || []) {
@@ -78,6 +87,8 @@ async function buildCreateOpts(self: any, imageRef: string): Promise<Docker.Cont
   const containerEnv = envToMap(self.Config?.Env);
   const finalEnv = new Map(newBaked); // 起步：新镜像 baked（含新 WOC_VERSION）
   for (const [k, v] of containerEnv) {
+    // 【镜像身份】变量绝不继承旧容器，永远用新镜像 baked 值（见 IMAGE_IDENTITY_ENV 注释）
+    if (IMAGE_IDENTITY_ENV.has(k)) continue;
     // compose 注入或覆盖的（旧镜像没有该 key，或容器值与旧 baked 不同）→ 保留
     if (!oldBaked.has(k) || oldBaked.get(k) !== v) finalEnv.set(k, v);
   }
