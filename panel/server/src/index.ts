@@ -470,7 +470,7 @@ app.post('/api/instances/:id/clientlog', async (req, reply) => {
 app.post('/api/admin/instances', async (req, reply) => {
   const admin = requireAdmin(req, reply);
   if (!admin) return;
-  const { name, reuseVolume, appType } = (req.body as any) ?? {};
+  const { name, reuseVolume, appType,proxyEnabled } = (req.body as any) ?? {};
   const allowedUserIds = Array.isArray((req.body as any)?.allowedUserIds) ? (req.body as any).allowedUserIds : [];
   if (!name || String(name).trim().length === 0 || String(name).length > 30) {
     return reply.code(400).send({ error: '实例名称为 1-30 个字符' });
@@ -487,7 +487,7 @@ app.post('/api/admin/instances', async (req, reply) => {
     }
     reuseVolumeName = reuseVolume;
   }
-  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type);
+  const inst = createInstance(String(name), admin.id, allowedUserIds, reuseVolumeName, type,proxyEnabled,);
   appendPanelLog(
     'INFO',
     `创建实例「${inst.name}」(${type}, id=${inst.id}) by ${admin.username}${reuseVolumeName ? ` · 复用卷 ${reuseVolumeName}` : ''} → 开始创建容器（镜像缺失会自动拉取，首次较慢）`,

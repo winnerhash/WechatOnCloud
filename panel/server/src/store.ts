@@ -43,6 +43,7 @@ export interface Instance {
   id: string; // 短 id，用于容器/卷命名
   name: string; // 显示名
   appType?: AppType; // 承载的应用类型；缺省（老实例）= wechat（见 instanceAppType）
+  proxyEnabled?: boolean;  
   icon?: string; // 自定义图标：data: 图片(base64) 或 builtin:<key>；缺省按 appType 取默认图标
   containerName: string; // woc-wx-<id>
   volumeName: string; // woc-data-<id>
@@ -318,6 +319,7 @@ export function createInstance(
   allowedUserIds: string[] = [],
   reuseVolumeName?: string,
   appType: AppType = 'wechat',
+  proxyEnabled: boolean = false,
 ) {
   const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   let id = randomBytes(5).toString('hex'); // 10 hex chars
@@ -333,6 +335,7 @@ export function createInstance(
     id,
     name: name.trim() || `${APP_LABELS[type]}-${id.slice(0, 4)}`,
     appType: type,
+    proxyEnabled,  
     containerName: `woc-wx-${id}`,
     volumeName,
     kasmUser: 'woc',

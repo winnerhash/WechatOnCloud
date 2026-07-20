@@ -222,6 +222,13 @@ function envList(inst: Instance): string[] {
     `PASSWORD=${inst.kasmPassword}`,
   ];
   // baseimage 仅检查该变量是否「已设置」（值无关），设上即不再给 Xvnc 加 -hw3d。
+  if (inst.proxyEnabled) {
+    env.push(
+      'HTTP_PROXY=http://172.17.0.1:7890',
+      'HTTPS_PROXY=http://172.17.0.1:7890',
+      'ALL_PROXY=socks5://172.17.0.1:7890'
+    );
+  }
   if (!ENABLE_GPU) env.push('DISABLE_DRI=1');
   // 透传 os 伪装开关给容器内的 00-woc-identity 钩子（决定是否把 /etc/os-release 改成 deepin）。
   env.push(`WOC_SPOOF_OS=${SPOOF_OS ? '1' : '0'}`);
