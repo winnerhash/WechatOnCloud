@@ -24,9 +24,15 @@ function resolveWechatImage(): string {
 let WECHAT_IMAGE = resolveWechatImage();
 
 // 版本耦合的安全兜底（P0：issue #112 后续）。版本耦合让面板偏好「与自身同版本」的实例镜像 tag，
-// 但若该 tag 在本地和 registry 都不存在——典型如某次 CI 只发布了面板、实例镜像构建失败——
-// 面板就会指向一个不存在的 tag，导致：可升级检测恒空（指示器消失）、创建/升级实例拉取失败。
-// 故启动时校验一次：偏好的具体版本 tag 不可达 → 回退 :latest，保证功能永不因版本错配而瘫痪。
+// 但若该 tag 确实没发布（典型如某次 CI 只发布了面板、实例镜像构建失败），面板会指向一个不存在的
+// tag，导致可升级检测恒空、创建/升级实例拉取失败。故启动时校验一次。
+//
+// ⚠️ 关键（issue #114）：必须区分「仓库明确说没有(404)」和「压根连不上仓库」。
+// 国内 NAS 极常见的情形是：`docker pull` 走加速镜像【能通】，但面板进程直连 registry API 的 fetch
+// 【不通】。旧实现把两者都当成"不存在"→ 回退到本地那份可能几周前的 `:latest` → 用户面板明明是新版、
+// 实例却永远停在老镜像，还打出"很可能该版本未成功发布"的误导文案。
+// 现在：只有仓库【确认 404】才回退；连不上时保持版本 tag（乐观），把判决权交给真正的 `docker pull`
+// （它有镜像加速配置，多半能拉到）；真拉不到时再由 ensureImage 兜底回退（见那里）。
 let imageResolved = false;
 export async function resolveInstanceImage(): Promise<void> {
   if (imageResolved) return;
@@ -41,12 +47,20 @@ export async function resolveInstanceImage(): Promise<void> {
     /* 本地没有，继续查 registry */
   }
   const ref = parseImageRef(preferred);
-  const remote = ref ? await fetchManifestDigest(ref) : null;
-  if (remote) return; // registry 上存在该版本 → 用它（ensureImage 会拉）
+  const probe = ref ? await probeManifest(ref) : ({ ok: false, reason: 'unreachable' } as const);
+  if (probe.ok) return; // 仓库上存在该版本 → 用它（ensureImage 会拉）
+  if (probe.reason === 'unreachable') {
+    // 连不上仓库 ≠ 版本不存在。保持版本 tag，让 docker pull（可能走加速镜像）去试。
+    appendPanelLog(
+      'WARN',
+      `无法连接镜像仓库校验 ${preferred}（网络受限？），仍按该版本拉取；若拉取失败会自动回退 :latest`,
+    );
+    return;
+  }
   const fallback = preferred.replace(/:[^/:]+$/, ':latest');
   appendPanelLog(
     'WARN',
-    `实例镜像 ${preferred} 在本地与镜像仓库均不存在，回退使用 ${fallback}（很可能该版本的实例镜像未成功发布；升级/检测将基于 :latest）`,
+    `镜像仓库确认不存在 ${preferred}（该版本的实例镜像可能未成功发布），回退使用 ${fallback}`,
   );
   WECHAT_IMAGE = fallback;
 }
@@ -239,10 +253,32 @@ async function ensureImage(): Promise<void> {
   try {
     await pullImage();
     appendPanelLog('INFO', `实例镜像拉取完成 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）`);
+    return;
   } catch (e: any) {
     appendPanelLog('ERROR', `实例镜像拉取失败 ${WECHAT_IMAGE}（耗时 ${Math.round((Date.now() - t0) / 1000)}s）：${e?.message || e}`);
+    // 真兜底（issue #114）：版本 tag 拉不到时，若本地已有 :latest 就退而求其次用它，别让用户彻底不能用。
+    // 这里基于【真实拉取失败】而非探测猜测——docker pull 有镜像加速配置，探测不通不代表拉不到。
+    const fb = fallbackLatestRef();
+    if (fb) {
+      try {
+        await docker.getImage(fb).inspect();
+        appendPanelLog('WARN', `改用本地已有的 ${fb} 重建（注意：它可能是较旧的镜像；网络恢复后请重新「升级实例」拿到 ${WECHAT_IMAGE}）`);
+        WECHAT_IMAGE = fb;
+        return;
+      } catch {
+        /* 本地也没有 :latest → 无可兜底，抛出原错误 */
+      }
+    }
     throw e;
   }
+}
+
+// 当前镜像引用对应的 :latest 形式；已是 latest / 无 tag 则返回 null（无可回退）。
+function fallbackLatestRef(): string | null {
+  const noDigest = WECHAT_IMAGE.split('@')[0];
+  const m = noDigest.match(/^(.*):([^/:]+)$/);
+  if (!m || m[2] === 'latest') return null;
+  return `${m[1]}:latest`;
 }
 
 // 创建并启动一个微信实例容器。若同名容器已存在则先移除（仅容器，不动卷）。
@@ -713,15 +749,16 @@ async function checkRemoteImageNewer(): Promise<boolean | null> {
     local = await docker.getImage(WECHAT_IMAGE).inspect();
   } catch {
     // 本地没有该镜像。版本耦合后这是常态：面板刚自更新到 vX，本地还只有旧版镜像、没有 :vX 的 tag。
-    // 只要远端确实存在该镜像（digest 可取）就视为「有新版可拉取」，让升级引导亮起（一键升级会先拉取）。
-    const remote = await fetchManifestDigest(ref);
-    return remote ? true : null;
+    // 远端确实存在该镜像 → 视为「有新版可拉取」，让升级引导亮起（一键升级会先拉取）。
+    // 连不上（unreachable）→ null=未知，不打扰；确认不存在（missing）→ 也没得升，null。
+    const probe = await probeManifest(ref);
+    return probe.ok ? true : null;
   }
   const repoDigests: string[] = local.RepoDigests || [];
   if (!repoDigests.length) return null; // 本地自构建（无 registry 来源）→ 无从比较，不打扰
-  const remote = await fetchManifestDigest(ref);
-  if (!remote) return null;
-  return !repoDigests.some((d) => d.endsWith('@' + remote));
+  const probe = await probeManifest(ref);
+  if (!probe.ok) return null; // 未知/不存在 → 不打扰
+  return !repoDigests.some((d) => d.endsWith('@' + probe.digest));
 }
 
 // 解析镜像引用 → { registry, repo, tag }。例：docker.io/gloridust/wechat-on-cloud:latest。
@@ -753,8 +790,12 @@ async function fetchJsonWithTimeout(url: string, headers: Record<string, string>
   }
 }
 
-// 取 registry 上该 tag 的 manifest digest（多架构 index 的 digest，与本地 RepoDigests 同层级）。
-async function fetchManifestDigest(ref: { registry: string; repo: string; tag: string }): Promise<string | null> {
+// 探测 registry 上该 tag 是否存在及其 manifest digest。
+// 关键（issue #114）：必须把「仓库确认没有(404)」与「连不上仓库(网络/超时/鉴权失败)」分开——
+// 前者才能据以回退，后者只是未知，不能当作"不存在"（否则受限网络用户会被误判、回退到过期的 :latest）。
+type ManifestProbe = { ok: true; digest: string } | { ok: false; reason: 'missing' | 'unreachable' };
+
+async function probeManifest(ref: { registry: string; repo: string; tag: string }): Promise<ManifestProbe> {
   const accept =
     'application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json';
   let host = ref.registry;
@@ -780,13 +821,17 @@ async function fetchManifestDigest(ref: { registry: string; repo: string; tag: s
         headers: { accept, ...(token ? { authorization: `Bearer ${token}` } : {}) },
         signal: ctrl.signal,
       });
-      if (!res.ok) return null;
-      return res.headers.get('docker-content-digest');
+      // 404 = 仓库明确回答"没有这个 tag"；其它非 2xx（401/5xx…）当作不可达，不敢断言不存在。
+      if (res.status === 404) return { ok: false, reason: 'missing' };
+      if (!res.ok) return { ok: false, reason: 'unreachable' };
+      const digest = res.headers.get('docker-content-digest');
+      return digest ? { ok: true, digest } : { ok: false, reason: 'unreachable' };
     } finally {
       clearTimeout(t);
     }
   } catch {
-    return null;
+    // 网络错误 / 超时 / 取 token 失败 → 未知，不是"不存在"
+    return { ok: false, reason: 'unreachable' };
   }
 }
 
@@ -1001,7 +1046,7 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
       '  system.txt        系统/Docker/镜像信息',
       '  panel.log         面板全局运维日志（创建/删除/升级/启停/镜像拉取/错误）',
       '  containers.txt    所有 woc-* 容器清单（含残留/未登记）',
-      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 实时容器日志',
+      '  instances/<id>.log 每个实例：容器状态 + 持久日志 + 应用安装状态/日志 + 实时容器日志',
       '',
       '把本压缩包发给维护者即可协助排查（不含密码/密钥等敏感信息）。',
     ].join('\n'),
@@ -1070,6 +1115,18 @@ export async function buildDiagnostics(instances: Instance[], sinceMs: number, m
       c += `===== 容器状态 =====\n无法读取（容器可能未创建/已删除）：${e?.message || e}\n\n`;
     }
     c += `===== 持久化日志（最近 ${meta.range || '24h'}） =====\n${filterSince(readInstanceLog(inst.id), sinceMs) || '（无）'}\n\n`;
+    // 应用安装状态 + 安装日志：排查「下载卡住/装不上」（此前诊断包里完全看不到安装为何失败）。
+    // status.json = 面板轮询的进度/错误；install.log = wechat-ctl.sh 下载/解压每步（含 curl 退出码、已下字节）。
+    try {
+      // `|| true`：文件不存在时 cat/tail 会以非 0 退出，execCapture 视作失败抛错——加 || true 保证退出 0，
+      // 拿到空串走下面的「（无）」分支，不因"还没装/旧镜像无日志"就整段丢失。
+      const st = (await execCapture(inst, ['sh', '-c', 'cat /config/.woc-state/status.json 2>/dev/null || true'])).trim();
+      c += `===== 应用安装状态（status.json） =====\n${st || '（无 / 尚未触发安装）'}\n\n`;
+      const il = (await execCapture(inst, ['sh', '-c', 'tail -n 50 /config/.woc-state/install.log 2>/dev/null || true'])).trimEnd();
+      c += `===== 安装日志（install.log 尾 50 行） =====\n${il || '（无 / 旧镜像未记录）'}\n\n`;
+    } catch (e: any) {
+      c += `===== 应用安装状态 / 安装日志 =====\n获取失败（容器可能未运行）：${e?.message || e}\n\n`;
+    }
     try {
       c += `===== 本次容器日志（实时 tail 300） =====\n${(await instanceLogs(inst, 300)).trimEnd() || '（无）'}\n`;
     } catch (e: any) {
