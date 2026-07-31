@@ -133,6 +133,21 @@ function allowAutoRecover(iid: string): boolean {
   return true;
 }
 
+// 转发输入条上的功能键（issue #125）。键名走 xdotool，须匹配服务端白名单 /^[A-Za-z_]{1,20}$/，
+// 故只放单键、不放组合键（ctrl+a 这类含 "+" 会被拒）。
+const FUNC_KEYS: { key: string; label: string; title: string }[] = [
+  { key: 'Escape', label: 'Esc', title: 'Escape（关弹窗/退出全屏输入）' },
+  { key: 'Tab', label: 'Tab', title: 'Tab（切换焦点）' },
+  // 用中文字面而非 ⌫（U+232B）：容器/部分系统缺字形会渲染成豆腐块，实测就是方框
+  { key: 'BackSpace', label: '退格', title: '退格（删除前一个字符）' },
+  { key: 'Delete', label: 'Del', title: 'Delete（删除后一个字符）' },
+  { key: 'Return', label: '↵', title: '回车（发送/换行）' },
+  { key: 'Left', label: '←', title: '左方向键' },
+  { key: 'Up', label: '↑', title: '上方向键' },
+  { key: 'Down', label: '↓', title: '下方向键' },
+  { key: 'Right', label: '→', title: '右方向键' },
+];
+
 const MenuIcon = (
   <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
     <path d="M4 6h16M4 12h16M4 18h16" />
@@ -204,6 +219,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
       if (window.isSecureContext && 'Notification' in window && Notification.permission === 'default') {
         Notification.requestPermission().catch(() => {});
       }
+    }
+  };
+  const [showKeys, setShowKeys] = useState(false);
+  // 转发输入条「发送后自动回车」开关（默认开，保持 issue #81 起的既有行为）。
+  // 关掉的场景（issue #125）：想先把长文/多行填进微信输入框里再自己斟酌、编辑后手动发；
+  // 自动回车会让文本一进框就被发出去，也让 Shift+回车换行之外的编辑很别扭。
+  const [autoEnter, setAutoEnter] = useState(() => {
+    try {
+      return window.localStorage.getItem('woc_ime_auto_enter') !== '0';
+    } catch {
+      return true;
+    }
+  });
+  const toggleAutoEnter = () => {
+    const v = !autoEnter;
+    setAutoEnter(v);
+    try {
+      window.localStorage.setItem('woc_ime_auto_enter', v ? '1' : '0');
+    } catch {
+      /* ignore */
     }
   };
   // 麦克风开关（默认关）：仅在「声音」开启时有意义；默认不抢占麦克风，避免把 AirPods 切到低质通话模式。
@@ -899,16 +934,26 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
 
   // 中文输入条发送：把本框文本经 xclip+xdotool 直接粘进微信当前聚焦的输入框（绕开 VNC IME）。
   // 在面板的真实 textarea 里用原生输入法打字，100% 可靠，不依赖 VNC 的 enable_ime / 合成事件。
+  const pressKey = async (key: string) => {
+    if (!id) return;
+    try {
+      await api.keyInInstance(id, key);
+    } catch (e: any) {
+      toast(e?.message || '按键失败：请确认实例已「升级实例」（镜像含 xdotool）', 'error');
+    }
+  };
+
   const sendImeText = async () => {
     const t = imeText;
     if (!t.trim() || !id) return;
     setImeSending(true);
     try {
       await api.typeInInstance(id, t);
-      // 打完直接补一个回车把消息发出去（issue #81），焦点【始终留在本输入条】。
+      // 打完补一个回车把消息发出去（issue #81）；可由「自动回车」开关关掉（issue #125），
+      // 关掉时只把文字填进应用输入框，发不发由用户自己按。焦点【始终留在本输入条】。
       // 切勿在转发模式把焦点切回虚拟机——那等于开了"无感输入"，用户接着打的拼音会以原始 keysym 直灌微信
       // 输入框（出现 "nniih'h你好啊" 这种串码）。下一条仍在本条用本机输入法安全地打。
-      await api.keyInInstance(id, 'Return');
+      if (autoEnter) await api.keyInInstance(id, 'Return');
       setImeText('');
     } catch (e: any) {
       toast(e?.message || '发送失败：请确认实例已「升级实例」（镜像含 xclip/xdotool）', 'error');
@@ -1166,7 +1211,13 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
           {!frameLoaded && loadStuck && (
             <div className="iv-loading">
               <div className="iv-loading-text">桌面无响应</div>
-              <div className="iv-loading-sub">连接超时。可能是实例临时卡住，先「重新连接」；若仍无效请「重启实例」。</div>
+              {/* 子用户无「重启实例」权限（按钮下方已按 isAdmin 隐藏），文案也要跟着变，
+                  否则会让人照着找一个根本不存在的按钮（issue #125）。 */}
+              <div className="iv-loading-sub">
+                {isAdmin
+                  ? '连接超时。可能是实例临时卡住，先「重新连接」；若仍无效请「重启实例」。'
+                  : '连接超时。可能是实例临时卡住，请先「重新连接」；若反复无效，请联系管理员重启该实例。'}
+              </div>
               <div className="iv-stuck-actions">
                 <button
                   className="btn btn-primary"
@@ -1181,9 +1232,11 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
                   </button>
                 )}
               </div>
-              <div className="iv-loading-sub" style={{ marginTop: 8 }}>
-                若反复无响应，点「重启实例」即可恢复（数据保留）。
-              </div>
+              {isAdmin && (
+                <div className="iv-loading-sub" style={{ marginTop: 8 }}>
+                  若反复无响应，点「重启实例」即可恢复（数据保留）。
+                </div>
+              )}
             </div>
           )}
 
@@ -1418,28 +1471,63 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
           </div>
 
           {inputMode === 'forward' && (
-            <div className="iv-imebar">
-              <textarea
-                className="iv-imebar-input"
-                value={imeText}
-                onChange={(e) => setImeText(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendImeText();
+            <>
+              {/* 功能键折叠集合（issue #125）：VNC 里这些键要么被浏览器吃掉、要么手机端根本没有，
+                  给一排直接点。经 xdotool 送出，键名须匹配服务端白名单 /^[A-Za-z_]{1,20}$/。 */}
+              {showKeys && (
+                <div className="iv-keybar">
+                  {FUNC_KEYS.map((k) => (
+                    <button key={k.key} className="iv-key" title={k.title} onClick={() => pressKey(k.key)}>
+                      {k.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className="iv-imebar">
+                <button
+                  className={'iv-imebar-tool' + (showKeys ? ' on' : '')}
+                  title="功能键（Esc / Tab / 退格 / 方向键…）"
+                  onClick={() => setShowKeys((v) => !v)}
+                >
+                  Fn
+                </button>
+                <textarea
+                  className="iv-imebar-input"
+                  value={imeText}
+                  onChange={(e) => setImeText(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      sendImeText();
+                    }
+                  }}
+                  placeholder={
+                    autoEnter
+                      ? '中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。'
+                      : '中文输入这里 → 回车只把文字填进应用输入框，不自动发送（发送由你按）。Shift+回车换行。'
                   }
-                }}
-                placeholder="中文输入这里 → 回车直接发送到应用（先点好应用的输入框）。Shift+回车换行。"
-                rows={1}
-              />
-              <button
-                className="btn btn-primary iv-imebar-send"
-                disabled={imeSending || !imeText.trim()}
-                onClick={sendImeText}
-              >
-                {imeSending ? '发送中' : '发送'}
-              </button>
-            </div>
+                  rows={1}
+                />
+                <button
+                  className={'iv-imebar-tool' + (autoEnter ? ' on' : '')}
+                  title={
+                    autoEnter
+                      ? '自动回车：开。文字送到应用后立刻回车发出。点击关闭（只填字不发送，便于先编辑再发）'
+                      : '自动回车：关。只把文字填进应用输入框，发送由你自己按。点击开启'
+                  }
+                  onClick={toggleAutoEnter}
+                >
+                  ↵
+                </button>
+                <button
+                  className="btn btn-primary iv-imebar-send"
+                  disabled={imeSending || !imeText.trim()}
+                  onClick={sendImeText}
+                >
+                  {imeSending ? '发送中' : autoEnter ? '发送' : '填入'}
+                </button>
+              </div>
+            </>
           )}
         </div>
       )}

@@ -88,6 +88,20 @@ do_install() {
   done
   : "${total:=0}"
 
+  # 磁盘空间预检（NAS 小盘写满是「卡进度/干脆没进度」头号真凶）：
+  # 盘满时 curl 以退出码 23=本地写失败告终，连 status.json 都写不进去（面板遂显示无进度），
+  # 极易被误当网络/代理问题（真实案例：用户为此查了半天梯子）。这里提前 df 判定，给可执行的磁盘报错。
+  # 需求 ≈ deb 本体 + dpkg-deb -x 解压(约 3× deb) + 更新时新旧并存余量 → 取 deb 4 倍，不低于 900MB 兜底。
+  local deb_kb need_kb avail_kb
+  deb_kb=$(( ( total > 0 ? total : 220000000 ) / 1024 ))
+  need_kb=$(( deb_kb * 4 )); [ "$need_kb" -lt 921600 ] && need_kb=921600
+  avail_kb="$(df -Pk "$WORK_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ -n "${avail_kb:-}" ] && [ "$avail_kb" -lt "$need_kb" ] 2>/dev/null; then
+    log "磁盘空间不足：$WORK_DIR 可用 $((avail_kb/1024))MB < 需要 $((need_kb/1024))MB"
+    write_status error 0 "磁盘空间不足：约需 $((need_kb/1024))MB 空闲，当前仅 $((avail_kb/1024))MB。请在宿主清理磁盘/旧镜像（docker image prune）后重试"
+    return
+  fi
+
   write_status downloading 0 "正在下载微信安装包"
   # 断点续传下载（-C -）：网络半路中断/被中间设备掐断时，下次从已下字节【继续】而非从 0 重来
   #（这正是"反复卡在同一百分比退出"的解药）。--retry-all-errors 对传输中断也重试；外层再多轮兜底。
@@ -119,6 +133,14 @@ do_install() {
   done
   if [ "$rc" -ne 0 ]; then
     log "下载最终失败 rc=$rc，已下 $(stat -c%s "$tmp" 2>/dev/null || echo 0)/$total"
+    # curl 退出码 23=本地写失败：几乎总是盘写满（本场景最常见）。别误导用户查网络——
+    # 再 df 复查一次，剩余空间过低同样判为磁盘问题，给磁盘专属报错。
+    avail_kb="$(df -Pk "$WORK_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+    if [ "$rc" -eq 23 ] || { [ -n "${avail_kb:-}" ] && [ "${avail_kb:-0}" -lt 51200 ] 2>/dev/null; }; then
+      log "判定为磁盘空间不足（rc=$rc，$WORK_DIR 可用 ${avail_kb:-?}KB）"
+      write_status error 0 "磁盘空间不足，下载无法写入。请在宿主清理磁盘/旧镜像（docker image prune）后重试"
+      return
+    fi
     write_status error 0 "下载失败（多次续传仍未完成，请检查网络/镜像后重试）"
     return
   fi

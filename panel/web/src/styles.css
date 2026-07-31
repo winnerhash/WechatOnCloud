@@ -1973,6 +1973,57 @@ button {
   flex: 0 0 auto;
   padding: 0 18px;
 }
+/* 输入条上的小开关（功能键折叠 / 自动回车）：牛奶布艺——默认凹槽，开启态顶起 */
+.iv-imebar-tool {
+  height: 38px;
+  width: 38px;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  background: var(--trough);
+  color: var(--muted);
+  box-shadow: inset 0 1px 3px rgba(var(--shadow) / 0.16);
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.iv-imebar-tool.on {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--crease);
+}
+.iv-imebar-tool:active {
+  transform: scale(0.94);
+}
+/* 功能键排：贴在输入条上方，同一块「布」上顶起的一排小胶囊 */
+.iv-keybar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px 0;
+  background: var(--base);
+  box-sizing: border-box;
+}
+.iv-key {
+  min-width: 40px;
+  height: 32px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--crease);
+  transition: transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.iv-key:active {
+  transform: scale(0.94);
+  box-shadow: var(--crease-press);
+}
 .iv-loading,
 .iv-drop {
   position: absolute;

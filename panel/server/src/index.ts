@@ -1562,25 +1562,66 @@ function parseCookies(header?: string): Record<string, string> {
   return out;
 }
 
+// ws 拒绝日志限流：key=实例id+原因，60s 内重复的不再落盘。返回 true 表示"本次应被抑制"。
+// 目的是既保住可诊断性（每种原因至少留一条），又不让 2s 一次的重连把日志刷爆。
+const wsRejectSeen = new Map<string, number>();
+function wsRejectThrottled(id: string, reason: string): boolean {
+  const key = `${id}|${reason}`;
+  const now = Date.now();
+  const last = wsRejectSeen.get(key) || 0;
+  if (now - last < 60_000) return true;
+  wsRejectSeen.set(key, now);
+  if (wsRejectSeen.size > 200) {
+    for (const [k, t] of wsRejectSeen) if (now - t > 60_000) wsRejectSeen.delete(k);
+  }
+  return false;
+}
+
 await app.ready();
 
 app.server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
+  // ⚠️ 这三道闸门此前一律「静默 socket.destroy()」，于是用户侧只看到桌面永远「重连中…」，
+  // 而面板/实例日志里一个字都没有 —— issue #124 的诊断包就是这样：iframe 反复加载、
+  // 容器里 KasmVNC 连一次 websocket 都没收到，却查不出被谁拦下。故每条拒绝路径都必须留痕。
+  const parsed = req.url ? parseDesktopUrl(req.url) : null; // 先解析，好把原因写进对应实例日志
+  const reject = (reason: string) => {
+    // 客户端 2~4s 重试一次，不限流会把日志刷爆（24h 可达数万行）→ 同实例同类原因 60s 内只记一次
+    if (!wsRejectThrottled(parsed?.id || '-', reason)) {
+      if (parsed) appendInstanceLog(parsed.id, `[vnc] 连接被拒：${reason}`);
+      appendPanelLog('WARN', `远程桌面 ws 被拒：${reason}（url=${req.url || '?'}）`);
+    }
+    socket.destroy();
+  };
   // DNS-rebinding gate for WebSocket upgrades (Fastify's onRequest hook does
   // not run on raw upgrades). KasmVNC proxying goes through this path.
   if (!isRequestHostAllowed(req.headers.host, req.headers['x-forwarded-host'], ALLOWED_HOSTS)) {
-    socket.destroy();
+    const xfh = req.headers['x-forwarded-host'];
+    reject(
+      `Host 不在白名单（host=${parseHost(req.headers.host) || '(空)'}、x-forwarded-host=${
+        (Array.isArray(xfh) ? xfh[0] : xfh) || '(无)'
+      }）。反代/公网域名部署请把该域名加入 PANEL_ALLOWED_HOSTS 后用 docker compose up -d 重建面板`,
+    );
     return;
   }
-  const parsed = req.url ? parseDesktopUrl(req.url) : null;
   if (!parsed) {
-    socket.destroy();
+    reject(`URL 不是合法的实例桌面地址（${req.url || '(空)'}）`);
     return;
   }
   const cookies = parseCookies(req.headers.cookie);
   const s = getSession(cookies[COOKIE]);
   const u = s && findById(s.userId);
   if (!u || u.disabled || !userCanAccess(u, parsed.id)) {
-    socket.destroy();
+    // 分清三种：根本没带 cookie（多为反代吞了 Cookie 头）/ 会话过期 / 有登录但无该实例权限
+    const why = !cookies[COOKIE]
+      ? '请求未携带会话 cookie（若用了反代，请确认它透传 Cookie 头且未改写路径）'
+      : !s
+        ? '会话已过期或无效，请重新登录'
+        : !u
+          ? '会话对应的用户已不存在'
+          : u.disabled
+            ? `用户「${(u as any).username}」已被禁用`
+            : `用户「${(u as any).username}」无权访问该实例`;
+    reject(why);
     return;
   }
   const inst = findInstance(parsed.id)!;
