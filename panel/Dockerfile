@@ -5,10 +5,10 @@ FROM node:22-slim AS web
 WORKDIR /web
 # 【优化1】切换淘宝 NPM 镜像源，国内速度飞起
 RUN npm config set registry https://registry.npmmirror.com
-COPY web/package.json ./
-# 【优化2】使用 BuildKit 缓存挂载，把下载的包缓存在宿主机，下次构建即使 package.json 变了也只需增量下载
+COPY web/package.json web/package-lock.json ./
+# 【优化2】BuildKit 缓存挂载，把下载的包缓存在宿主机，下次构建即使 lockfile 变了也只需增量下载（配合上游 npm ci 锁版本）
 RUN --mount=type=cache,target=/root/.npm \
-    npm install
+    npm ci
 COPY web/ ./
 RUN npm run build
 
@@ -18,10 +18,10 @@ WORKDIR /app
 ENV NODE_ENV=production
 # 【优化1】后端也切换淘宝源
 RUN npm config set registry https://registry.npmmirror.com
-COPY server/package.json ./
+COPY server/package.json server/package-lock.json ./
 # 【优化2】后端同样使用缓存挂载
 RUN --mount=type=cache,target=/root/.npm \
-    npm install
+    npm ci --omit=dev
 COPY server/ ./
 COPY --from=web /web/dist ./web-dist
 
@@ -33,4 +33,3 @@ ENV WOC_VERSION=${WOC_VERSION} \
     PORT=8080
 EXPOSE 8080
 CMD ["npm", "run", "start"]
-
