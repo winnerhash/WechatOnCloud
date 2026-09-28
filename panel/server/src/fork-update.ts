@@ -53,7 +53,7 @@ async function doForkUpdate(): Promise<{ message: string }> {
       // 代理（host 网络下 127.0.0.1 直达宿主 clash）—— git fetch/push 访问 github 走代理
       'HTTP_PROXY=' + PROXY,
       'HTTPS_PROXY=' + PROXY,
-      'NO_PROXY=localhost,127.0.0.1,::1',
+      'NO_PROXY=localhost,127.0.0.1,::1,mirrors.aliyun.com',
     ],
     Cmd: [
       '/bin/sh', '-c',
